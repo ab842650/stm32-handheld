@@ -33,7 +33,7 @@ extern QueueHandle_t ui_event_queue;   /* 退出時清掉累積觸控 */
 #include "peanut_gb.h"
 
 #define GB_BANK_SIZE    (16 * 1024)     /* bank 0 大小（釘住）*/
-#define GB_CARTRAM_MAX  (8 * 1024)
+#define GB_CARTRAM_MAX  (32 * 1024)     /* 存檔 RAM 最大 32KB（寶可夢就是 32KB）*/
 
 /* 細粒度 ROM 快取（像 CPU cache）：512B 一條 line、32 條 direct-mapped = 16KB。
  * miss 只讀 512B（~1ms 而非整 bank 12ms），且能同時快取 32 個分散熱區。*/
@@ -46,7 +46,7 @@ static struct gb_s gb          __attribute__((section(".ccmram_bss")));
 static uint8_t gb_bank0[GB_BANK_SIZE]  __attribute__((section(".ccmram_bss"))); /* 固定 bank 0，釘住 */
 static uint8_t gb_cache[GB_NLINES * GB_LINE_SZ] __attribute__((section(".ccmram_bss"))); /* 可切換區的 line 快取 */
 static uint32_t gb_tag[GB_NLINES];      /* 每條 line 目前存哪個 512B 區塊(line 號)；0xFFFFFFFF=空 */
-static uint8_t gb_cartram[GB_CARTRAM_MAX] __attribute__((section(".ccmram_bss")));
+static uint8_t gb_cartram[GB_CARTRAM_MAX];   /* 存檔 RAM 放 SRAM（32KB，CCM 塞不下）*/
 static FIL     gb_fil;          /* 遊玩期間保持開啟，供 gb_rom_read 換頁 */
 
 static int gb_err_flag;
@@ -79,10 +79,16 @@ static uint8_t gb_cart_ram_read(struct gb_s *g, const uint_fast32_t addr)
     (void)g;
     return (addr < GB_CARTRAM_MAX) ? gb_cartram[addr] : 0xFF;
 }
+static int      gb_ram_dirty;   /* cart RAM 被寫過、還沒刷到 SD */
+static uint32_t gb_ram_wtime;   /* 最後一次寫入的時間（用來 debounce）*/
 static void gb_cart_ram_write(struct gb_s *g, const uint_fast32_t addr, const uint8_t val)
 {
     (void)g;
-    if (addr < GB_CARTRAM_MAX) gb_cartram[addr] = val;
+    if (addr < GB_CARTRAM_MAX) {
+        gb_cartram[addr] = val;
+        gb_ram_dirty = 1;
+        gb_ram_wtime  = HAL_GetTick();   /* 記下時間，供自動存檔判斷 */
+    }
 }
 static void gb_error_cb(struct gb_s *g, const enum gb_error_e err, const uint16_t addr)
 {
@@ -195,6 +201,20 @@ static void gb_menu(void)
     }
 }
 
+/* 把 cart RAM 寫回 .sav（存到 SD）。只有「有存檔的遊戲」且「有未存變更」才寫。*/
+static void gb_flush_sav(const char *savpath, size_t save_size)
+{
+    if (save_size == 0 || !gb_ram_dirty) return;
+    ILI9341_DrawString(2, 0, "saving...", ILI9341_WHITE, ILI9341_BLACK);
+    FIL  sf;
+    UINT sbw;
+    if (f_open(&sf, savpath, FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
+        f_write(&sf, gb_cartram, save_size, &sbw);
+        f_close(&sf);
+    }
+    gb_ram_dirty = 0;
+}
+
 /* 載入並執行一個 ROM（選單點選後呼叫，阻塞到玩家 QUIT）*/
 static void gb_run(const char *romname)
 {
@@ -231,7 +251,26 @@ static void gb_run(const char *romname)
         return;
     }
 
-    (void)line; (void)romname;
+    (void)line;
+
+    /* ── 讀存檔：/GB/NAME.sav → cart RAM ── */
+    size_t save_size = 0;
+    gb_get_save_size_s(&gb, &save_size);          /* 這遊戲的存檔大小（無=0）*/
+    char savpath[32];
+    strcpy(savpath, "/GB/");
+    strcat(savpath, romname);
+    { char *d = strrchr(savpath, '.');            /* 把副檔名換成 .sav */
+      strcpy(d ? d : savpath + strlen(savpath), ".sav"); }
+    memset(gb_cartram, 0, GB_CARTRAM_MAX);        /* 沒存檔就從全 0 開始 */
+    if (save_size > 0) {
+        FIL  sf;
+        UINT sbr;
+        if (f_open(&sf, savpath, FA_READ) == FR_OK) {
+            f_read(&sf, gb_cartram, save_size, &sbr);
+            f_close(&sf);
+        }
+    }
+    gb_ram_dirty = 0;                             /* 剛載入，乾淨 */
 
     /* G1：註冊畫線 callback → 開始跑遊戲 */
     gb_init_lcd(&gb, lcd_draw_line);
@@ -256,9 +295,16 @@ static void gb_run(const char *romname)
         }
         gb.direct.joypad = jp;
 
+        uint32_t now = HAL_GetTick();
+
+        /* 自動存檔：cart RAM 寫完靜下來 1.5s 就刷到 SD
+         * → 遊戲內按 SAVE 後，約 1.5 秒自動持久化到 SD（不必退出）*/
+        if (gb_ram_dirty && (now - gb_ram_wtime) > 1500) {
+            gb_flush_sav(savpath, save_size);
+        }
+
         /* --- FPS：每秒算一次「模擬了幾幀」(60=真實速度) --- */
         fps_n++;
-        uint32_t now = HAL_GetTick();
         if (now - fps_t0 >= 1000) {
             char s[12];
             snprintf(s, sizeof(s), "%lufps", (unsigned long)(fps_n * 1000 / (now - fps_t0)));
@@ -267,7 +313,8 @@ static void gb_run(const char *romname)
         }
     }
 
-    f_close(&gb_fil);              /* 關掉 ROM 檔（回選單）*/
+    gb_flush_sav(savpath, save_size);   /* 退出時再刷一次（若有未存變更）*/
+    f_close(&gb_fil);                   /* 關掉 ROM 檔（回選單）*/
 }
 
 static void gb_enter(void)

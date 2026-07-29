@@ -77,7 +77,8 @@ Drivers/BSP
 - [x] 階段 9：**CHIP-8 模擬器** — 一個 module 跑多 ROM（/ROMS），syscall 加 read_file/list_dir
 - [x] 階段 10：**Game Boy 模擬器**（Peanut-GB）— 內建 app、ROM 存 SD、CCM 工作記憶體、觸控 8 鍵、50fps（1x）
 - [x] 階段 10.5：**MBC 大遊戲**（寶可夢等）— ROM 從 SD 串流 + ROM 選單。**細粒度快取（512B×32 direct-mapped CPU cache）→ 寶可夢從個位數 fps → ~60fps**
-- [ ] 階段 10.6：GB 存檔（cart RAM 寫回 SD）、選單捲動 ← 待辦
+- [x] 階段 10.6：**GB 存檔** — cart RAM 32KB 移到 SRAM（縮 FreeRTOS heap 75→48KB 騰空間）、`.sav` 存 SD。**debounced 自動存檔**：遊戲內 SAVE → cart RAM dirty → 靜置 1.5s 自動刷到 SD（Peanut-GB 只在遊戲啟用 cart RAM 時才寫，故不會誤觸發）
+- [ ] 階段 10.7：選單捲動（>6 ROM）、WiFi（ESP32 UART）← 之後
 
 ---
 
