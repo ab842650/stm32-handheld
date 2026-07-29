@@ -1,0 +1,29 @@
+# Build 產物
+/Debug/
+/Release/
+*.o
+*.d
+*.su
+*.cyclo
+*.elf
+*.map
+*.list
+
+# 版權 / 大型媒體：不要推上公開 repo
+# 大型 WAV 音檔（~75MB）
+music/
+# Game Boy ROM（商業遊戲有版權）
+*.gb
+*.gbc
+# 遊戲存檔
+*.sav
+# 私人 / 測試圖（可用 tools/*.py 重新產生）
+tools/*.jpg
+tools/*.bmp
+
+# IDE / 本機
+.claude/
+*.launch
+lab5.ioc.bak
+.DS_Store
+Thumbs.db
