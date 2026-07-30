@@ -15,6 +15,7 @@
 extern TIM_HandleTypeDef htim2;
 extern DMA_HandleTypeDef hdma_spi1_tx;
 extern TaskHandle_t      inputTaskHandle;
+extern UART_HandleTypeDef huart3;
 
 /* Cortex-M4 Exception Handlers -----------------------------------------------*/
 
@@ -60,6 +61,14 @@ void TIM2_IRQHandler(void)
 void EXTI9_5_IRQHandler(void)
 {
     HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_5);
+}
+
+/**
+  * @brief USART3 — ESP32 UART。HAL 處理旗標並在收滿時呼叫 RxCpltCallback
+  */
+void USART3_IRQHandler(void)
+{
+    HAL_UART_IRQHandler(&huart3);
 }
 
 /* USER CODE END 1 */

@@ -31,6 +31,7 @@
 
 /* Private variables ---------------------------------------------------------*/
 UART_HandleTypeDef huart2;
+UART_HandleTypeDef huart3;          /* ESP32-S3 WiFi 連線（PB10/PB11）*/
 SPI_HandleTypeDef  hspi1;
 SPI_HandleTypeDef  hspi2;           /* SD 卡（獨立 SPI2）*/
 DMA_HandleTypeDef  hdma_spi1_tx;
@@ -40,12 +41,23 @@ DMA_HandleTypeDef  hdma_spi1_tx;
 SemaphoreHandle_t  spi_bus_mutex;   /* 保護 SPI1 匯流排 */
 QueueHandle_t      ui_event_queue;  /* InputTask → UITask */
 TaskHandle_t       inputTaskHandle;
+
+/* ── ESP32 UART 接收：中斷 ISR 寫入、task 讀出的環形緩衝區 ── */
+#define ESP_RX_SZ 256
+static volatile uint8_t  esp_rx_buf[ESP_RX_SZ];
+static volatile uint16_t esp_rx_head;   /* ISR 寫到哪 */
+static volatile uint16_t esp_rx_tail;   /* task 讀到哪 */
+static uint8_t           esp_rx_byte;   /* HAL 每次收 1 byte 暫存這 */
+
+/* 從 NTP 對時得到的「一天中的秒數」offset，時鐘顯示時加上去（screen_clock.c 讀）*/
+volatile uint32_t g_clock_offset = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
+static void MX_USART3_UART_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_SPI2_Init(void);
 static void MX_DMA_Init(void);
@@ -53,6 +65,8 @@ static void MX_DMA_Init(void);
 /* USER CODE BEGIN PFP */
 void vUITask(void *pvParameters);
 void vInputTask(void *pvParameters);
+static int esp_rx_pop(uint8_t *out);
+static void esp_parse_line(const char *s);
 /* USER CODE END PFP */
 
 /**
@@ -66,6 +80,7 @@ int main(void)
     MX_DMA_Init();      /* DMA 必須在 SPI 之前初始化 */
     MX_GPIO_Init();
     MX_USART2_UART_Init();
+    MX_USART3_UART_Init();      /* ESP32-S3 UART */
     MX_SPI1_Init();
     MX_SPI2_Init();     /* SD 卡 SPI */
     MX_FATFS_Init();    /* 連結 FatFs 磁碟驅動（USER_Driver → user_diskio_spi）*/
@@ -194,6 +209,25 @@ static void MX_USART2_UART_Init(void)
 }
 
 /**
+  * @brief USART3 — 115200，PB10(TX)/PB11(RX)，接 ESP32-S3 做 WiFi
+  */
+static void MX_USART3_UART_Init(void)
+{
+    huart3.Instance          = USART3;
+    huart3.Init.BaudRate     = 115200;
+    huart3.Init.WordLength   = UART_WORDLENGTH_8B;
+    huart3.Init.StopBits     = UART_STOPBITS_1;
+    huart3.Init.Parity       = UART_PARITY_NONE;
+    huart3.Init.Mode         = UART_MODE_TX_RX;
+    huart3.Init.HwFlowCtl    = UART_HWCONTROL_NONE;
+    huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+    if (HAL_UART_Init(&huart3) != HAL_OK) { Error_Handler(); }
+
+    /* 武裝中斷接收：收到 1 byte 就中斷 → HAL_UART_RxCpltCallback */
+    HAL_UART_Receive_IT(&huart3, &esp_rx_byte, 1);
+}
+
+/**
   * @brief GPIO Initialization
   *
   * SPI1 的 SCK/MISO/MOSI 腳位由 HAL_SPI_MspInit 在 HAL_SPI_Init 時自動設定。
@@ -318,6 +352,29 @@ void vUITask(void *pvParameters)
             Screen_OnTouch(evt.x, evt.y);
         }
         Screen_OnRender();   /* 每輪都呼叫；靜態畫面的 on_render 留空即可 */
+
+        /* ── W4 暫時測試：每 2 秒問一次 TIME?，回話拿去對時鐘 ── */
+        static uint32_t last_q = 0;
+        if (HAL_GetTick() - last_q >= 2000) {
+            last_q = HAL_GetTick();
+            const char msg[] = "TIME?\r\n";
+            HAL_UART_Transmit(&huart3, (uint8_t *)msg, sizeof(msg) - 1, 100);
+        }
+        /* 組行：把 ring buffer 的 byte 累積成一整行，遇換行就解析 */
+        static char    esp_line[64];
+        static uint8_t esp_len = 0;
+        uint8_t rx;
+        while (esp_rx_pop(&rx)) {
+            if (rx == '\n' || rx == '\r') {
+                if (esp_len > 0) {
+                    esp_line[esp_len] = '\0';
+                    esp_parse_line(esp_line);
+                    esp_len = 0;
+                }
+            } else if (esp_len < sizeof(esp_line) - 1) {
+                esp_line[esp_len++] = rx;
+            }
+        }
     }
 }
 
@@ -370,6 +427,43 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
         vTaskNotifyGiveFromISR(inputTaskHandle, &xHigherPriorityTaskWoken);
         portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
+}
+
+/* UART 接收完成回呼 — HAL 每收到 1 byte 自動呼叫一次
+ * 把 byte 塞進 ring buffer，然後重新武裝下一次接收 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART3) {
+        uint16_t next = (esp_rx_head + 1) % ESP_RX_SZ;
+        if (next != esp_rx_tail) {          /* buffer 沒滿才寫，滿了就丟掉這 byte */
+            esp_rx_buf[esp_rx_head] = esp_rx_byte;
+            esp_rx_head = next;
+        }
+        HAL_UART_Receive_IT(&huart3, &esp_rx_byte, 1);   /* 重新武裝，繼續收下一個 */
+    }
+}
+
+/* 從 ring buffer 撈一個 byte；有資料回 1，空的回 0 */
+static int esp_rx_pop(uint8_t *out)
+{
+    if (esp_rx_head == esp_rx_tail) return 0;   /* 空 */
+    *out = esp_rx_buf[esp_rx_tail];
+    esp_rx_tail = (esp_rx_tail + 1) % ESP_RX_SZ;
+    return 1;
+}
+
+/* 解析一整行 ESP32 回話。目前認得 "TIME HH:MM:SS" → 更新時鐘 offset */
+static void esp_parse_line(const char *s)
+{
+    myprintf("ESP: %s\r\n", s);                 /* debug：印出收到的整行 */
+
+    unsigned h, m, sec;
+    if (sscanf(s, "TIME %u:%u:%u", &h, &m, &sec) == 3) {
+        uint32_t uptime = xTaskGetTickCount() / configTICK_RATE_HZ;   /* 開機至今秒數 */
+        uint32_t target = h * 3600 + m * 60 + sec;                    /* 真實的一天秒數 */
+        /* offset：讓 (uptime + offset) 的一天秒數 == target */
+        g_clock_offset = (target + 86400u - (uptime % 86400u)) % 86400u;
     }
 }
 

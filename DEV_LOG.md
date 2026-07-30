@@ -78,7 +78,12 @@ Drivers/BSP
 - [x] 階段 10：**Game Boy 模擬器**（Peanut-GB）— 內建 app、ROM 存 SD、CCM 工作記憶體、觸控 8 鍵、50fps（1x）
 - [x] 階段 10.5：**MBC 大遊戲**（寶可夢等）— ROM 從 SD 串流 + ROM 選單。**細粒度快取（512B×32 direct-mapped CPU cache）→ 寶可夢從個位數 fps → ~60fps**
 - [x] 階段 10.6：**GB 存檔** — cart RAM 32KB 移到 SRAM（縮 FreeRTOS heap 75→48KB 騰空間）、`.sav` 存 SD。**debounced 自動存檔**：遊戲內 SAVE → cart RAM dirty → 靜置 1.5s 自動刷到 SD（Peanut-GB 只在遊戲啟用 cart RAM 時才寫，故不會誤觸發）
-- [ ] 階段 10.7：選單捲動（>6 ROM）、WiFi（ESP32 UART）← 之後
+- [ ] 階段 10.7：選單捲動（>6 ROM）← 之後
+
+**WiFi（ESP32-S3 協處理器，UART 連線）**
+- [x] 階段 11：**WiFi 連線** — ESP32-S3 當 WiFi 協處理器，STM32 走 USART3(PB10/PB11) 下高階指令
+  - W0 單向 TX → W1 雙向 + **中斷接收 ring buffer**（手寫驅動）→ W2 ESP32 上網查 IP → W4 **NTP 對時**（首頁時鐘顯示真實時間）
+- [ ] 階段 11.5：搬進 `vNetTask`、W3 HTTP GET、W5 下載檔案到 SD、網路 syscall ← 之後
 
 ---
 
@@ -108,6 +113,32 @@ Drivers/BSP
 -
 -->
 <!-- ↑↑↑ 複製上面 ↑↑↑ -->
+
+### 2026-07-30 ｜ WiFi 起步：ESP32-S3 協處理器 + UART 連線 + NTP 對時
+
+**目標**：讓手機能上網。用 ESP32-S3 當 WiFi 協處理器（TCP/IP 跑在 ESP32），STM32 走 UART 下高階文字指令。
+
+**做了什麼**：
+- 硬體連線：STM32 **USART3, PB10(TX)/PB11(RX)**，AF7，APB1，115200 8N1；ESP32-S3 `Serial1` GPIO18/17；共地。查過腳位確定無衝突。
+- ESP32 端（Arduino 自訂韌體）：WiFi STA 連線、NTP 對時（UTC+8）、文字協定指令 `PING`/`WIFI?`/`TIME?`。
+- STM32 端接收（手寫驅動練習）：**中斷驅動 + 256B 環形緩衝區**。`HAL_UART_Receive_IT` 上膛 → `HAL_UART_RxCpltCallback` push byte + 重新上膛 → `USART3_IRQHandler`；NVIC 優先級 5。TX 用阻塞 `HAL_UART_Transmit`。
+- 文字協定：組行（byte 累積到 `\n`）→ `esp_parse_line` sscanf 解析 → `TIME HH:MM:SS` 算出 `g_clock_offset` → 首頁時鐘加 offset 顯示真實時間。
+- 里程碑：W0 單向 → W1 雙向 ring buffer → W2 上網查 IP → W4 NTP 時鐘變準。
+
+**遇到的問題**：
+- 編譯 `esp_rx_pop` static 宣告在使用之後 → 隱式宣告衝突 → 加前向宣告。
+- 測試中一度觸控失靈 → 移除測試碼再加回又正常 → 判定是燒錄/接線暫時性，非測試碼衝突（測試碼每 2 秒 <2ms，且觸控走獨立 EXTI+InputTask，不受 UI 迴圈影響）。
+
+**學到 / 筆記**：
+- 「收」比「送」難：對方發送時機不可控 → 中斷 + ring buffer 解耦（ISR 快進快出、task 慢慢撈）。
+- ring buffer head(ISR寫)/tail(task讀) 各碰各的，單生產者單消費者天然免鎖；`volatile` 必要。
+- HAL 中斷接收要在回呼裡「重新上膛」才會連續收。
+- NVIC 優先級數字 ≥ `configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY`(5) 才能在 ISR 用 FromISR API。
+- 協定設計成文字行（`\n` 結尾），好除錯、好擴充。
+
+**下一步**：
+- 把臨時測試碼搬進獨立 `vNetTask`（長傳輸不拖畫面）。
+- W3 HTTP GET（抓天氣/API）、W5 下載檔案到 SD、給 module 用的網路 syscall。
 
 ### 2026-07-27~28 ｜ Game Boy 模擬器（Peanut-GB，內建 app）+ 效能調校
 

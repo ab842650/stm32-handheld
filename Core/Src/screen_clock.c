@@ -22,6 +22,8 @@
 
 static uint32_t last_shown = 0xFFFFFFFF;        /* 上次顯示的秒數，強制第一次重畫 */
 
+extern volatile uint32_t g_clock_offset;        /* NTP 對時的 offset（main.c）*/
+
 /* 用放大字置中畫出 "HH:MM:SS" */
 static void draw_time(uint32_t secs)
 {
@@ -62,7 +64,7 @@ static void clock_touch(uint16_t x, uint16_t y)
 /* 由 vUITask 定期呼叫；只有秒數變了才重畫 */
 static void clock_render(void)
 {
-    uint32_t secs = xTaskGetTickCount() / configTICK_RATE_HZ;
+    uint32_t secs = xTaskGetTickCount() / configTICK_RATE_HZ + g_clock_offset;
     if (secs == last_shown) return;             /* 同一秒 → 不動 */
     last_shown = secs;
     draw_time(secs);

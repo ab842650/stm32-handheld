@@ -127,6 +127,22 @@ void HAL_UART_MspInit(UART_HandleTypeDef* huart)
         GPIO_InitStruct.Alternate = GPIO_AF7_USART2;
         HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
     }
+    else if (huart->Instance == USART3)
+    {
+        __HAL_RCC_USART3_CLK_ENABLE();
+        __HAL_RCC_GPIOB_CLK_ENABLE();
+
+        GPIO_InitStruct.Pin       = GPIO_PIN_10 | GPIO_PIN_11;   /* PB10=TX, PB11=RX */
+        GPIO_InitStruct.Mode      = GPIO_MODE_AF_PP;
+        GPIO_InitStruct.Pull      = GPIO_NOPULL;
+        GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
+        GPIO_InitStruct.Alternate = GPIO_AF7_USART3;
+        HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+        /* 開 USART3 中斷：優先級 5（數字 ≥ FreeRTOS 門檻，ISR 內可安全用 FromISR API）*/
+        HAL_NVIC_SetPriority(USART3_IRQn, 5, 0);
+        HAL_NVIC_EnableIRQ(USART3_IRQn);
+    }
 }
 
 void HAL_UART_MspDeInit(UART_HandleTypeDef* huart)
@@ -135,6 +151,11 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* huart)
     {
         __HAL_RCC_USART2_CLK_DISABLE();
         HAL_GPIO_DeInit(GPIOA, GPIO_PIN_2 | GPIO_PIN_3);
+    }
+    else if (huart->Instance == USART3)
+    {
+        __HAL_RCC_USART3_CLK_DISABLE();
+        HAL_GPIO_DeInit(GPIOB, GPIO_PIN_10 | GPIO_PIN_11);
     }
 }
 
