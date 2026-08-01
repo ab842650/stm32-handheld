@@ -10,6 +10,8 @@
 #include "main.h"
 
 /* USER CODE BEGIN Includes */
+#include <string.h>
+#include <stdio.h>
 #include "myprintf.h"
 #include "ili9341.h"
 #include "xpt2046.h"
@@ -51,6 +53,8 @@ static uint8_t           esp_rx_byte;   /* HAL 每次收 1 byte 暫存這 */
 
 /* 從 NTP 對時得到的「一天中的秒數」offset，時鐘顯示時加上去（screen_clock.c 讀）*/
 volatile uint32_t g_clock_offset = 0;
+volatile uint8_t  g_time_valid   = 0;   /* 已成功對到時 = 1 */
+char              g_weather[48]  = "";  /* 最近一次抓到的天氣字串 */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -65,6 +69,7 @@ static void MX_DMA_Init(void);
 /* USER CODE BEGIN PFP */
 void vUITask(void *pvParameters);
 void vInputTask(void *pvParameters);
+void vNetTask(void *pvParameters);
 static int esp_rx_pop(uint8_t *out);
 static void esp_parse_line(const char *s);
 /* USER CODE END PFP */
@@ -104,12 +109,12 @@ int main(void)
 
     xTaskCreate(vUITask,    "UITask",    2560, NULL, 3, NULL);   /* 2560 words(10KB)：module 狀態放堆疊，CHIP-8 記憶體 4KB+顯示緩衝 */
     xTaskCreate(vInputTask, "InputTask", 256, NULL, 4, &inputTaskHandle);
+    xTaskCreate(vNetTask,   "NetTask",   512, NULL, 2, NULL);    /* ESP32 UART：對時 + 收指令回話 */
 
     ScreenHome_Register();
     ScreenCalc_Register();
     ScreenGame_Register();
     ScreenPhoto_Register();
-    ScreenClock_Register();
     ScreenNotes_Register();
     ScreenGB_Register();
 
@@ -352,29 +357,6 @@ void vUITask(void *pvParameters)
             Screen_OnTouch(evt.x, evt.y);
         }
         Screen_OnRender();   /* 每輪都呼叫；靜態畫面的 on_render 留空即可 */
-
-        /* ── W4 暫時測試：每 2 秒問一次 TIME?，回話拿去對時鐘 ── */
-        static uint32_t last_q = 0;
-        if (HAL_GetTick() - last_q >= 2000) {
-            last_q = HAL_GetTick();
-            const char msg[] = "TIME?\r\n";
-            HAL_UART_Transmit(&huart3, (uint8_t *)msg, sizeof(msg) - 1, 100);
-        }
-        /* 組行：把 ring buffer 的 byte 累積成一整行，遇換行就解析 */
-        static char    esp_line[64];
-        static uint8_t esp_len = 0;
-        uint8_t rx;
-        while (esp_rx_pop(&rx)) {
-            if (rx == '\n' || rx == '\r') {
-                if (esp_len > 0) {
-                    esp_line[esp_len] = '\0';
-                    esp_parse_line(esp_line);
-                    esp_len = 0;
-                }
-            } else if (esp_len < sizeof(esp_line) - 1) {
-                esp_line[esp_len++] = rx;
-            }
-        }
     }
 }
 
@@ -416,6 +398,52 @@ void vInputTask(void *pvParameters)
         /* ③ 清掉這期間累積的假通知（PENIRQ 抖動造成的），
          *    timeout = 0 → 不等待，純粹把計數歸零 */
         ulTaskNotifyTake(pdTRUE, 0);
+    }
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * vNetTask — 管 ESP32 UART：對時 + 收指令回話
+ *
+ * 為什麼獨立一個 task：網路操作（尤其之後下載檔案）可能傳很久，
+ * 放在 UI 迴圈會拖畫面。獨立 task + 低優先級，不跟渲染/觸控搶。
+ *
+ * 目前工作：定期問 TIME? 校準時鐘（對到前 3s 重試、對到後 60s 校準），
+ * 順便撈 ring buffer 把 ESP32 回話組成整行交給 esp_parse_line。
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+void vNetTask(void *pvParameters)
+{
+    char     line[64];
+    uint8_t  len     = 0;
+    uint32_t last_q  = 0;
+    uint32_t last_wx = 0;
+
+    for (;;) {
+        /* 定期送 TIME?：還沒對到時 3 秒重試，對到後 60 秒校準一次 */
+        uint32_t interval = g_time_valid ? 60000 : 3000;
+        if (last_q == 0 || HAL_GetTick() - last_q >= interval) {
+            last_q = HAL_GetTick();
+            const char msg[] = "TIME?\r\n";
+            HAL_UART_Transmit(&huart3, (uint8_t *)msg, sizeof(msg) - 1, 100);
+        }
+
+        /* 定期送 WX?：每 30 秒抓一次天氣（測試用，正式可放慢到數分鐘）*/
+        if (last_wx == 0 || HAL_GetTick() - last_wx >= 30000) {
+            last_wx = HAL_GetTick();
+            const char m2[] = "WX?\r\n";
+            HAL_UART_Transmit(&huart3, (uint8_t *)m2, sizeof(m2) - 1, 100);
+        }
+
+        /* 撈 ring buffer，組行，遇換行就解析 */
+        uint8_t rx;
+        while (esp_rx_pop(&rx)) {
+            if (rx == '\n' || rx == '\r') {
+                if (len > 0) { line[len] = '\0'; esp_parse_line(line); len = 0; }
+            } else if (len < sizeof(line) - 1) {
+                line[len++] = rx;
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));   /* 20ms 輪詢一次，回話延遲可忽略 */
     }
 }
 
@@ -464,6 +492,14 @@ static void esp_parse_line(const char *s)
         uint32_t target = h * 3600 + m * 60 + sec;                    /* 真實的一天秒數 */
         /* offset：讓 (uptime + offset) 的一天秒數 == target */
         g_clock_offset = (target + 86400u - (uptime % 86400u)) % 86400u;
+        g_time_valid = 1;
+        return;
+    }
+
+    /* "WX <內容>" → 存起來（之後放上畫面）*/
+    if (strncmp(s, "WX ", 3) == 0) {
+        strncpy(g_weather, s + 3, sizeof(g_weather) - 1);
+        g_weather[sizeof(g_weather) - 1] = '\0';
     }
 }
 

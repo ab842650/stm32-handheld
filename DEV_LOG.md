@@ -82,8 +82,9 @@ Drivers/BSP
 
 **WiFi（ESP32-S3 協處理器，UART 連線）**
 - [x] 階段 11：**WiFi 連線** — ESP32-S3 當 WiFi 協處理器，STM32 走 USART3(PB10/PB11) 下高階指令
-  - W0 單向 TX → W1 雙向 + **中斷接收 ring buffer**（手寫驅動）→ W2 ESP32 上網查 IP → W4 **NTP 對時**（首頁時鐘顯示真實時間）
-- [ ] 階段 11.5：搬進 `vNetTask`、W3 HTTP GET、W5 下載檔案到 SD、網路 syscall ← 之後
+  - W0 單向 TX → W1 雙向 + **中斷接收 ring buffer**（手寫驅動）→ W2 ESP32 上網查 IP → W4 **NTP 對時**
+- [x] 階段 11.5：**架構整理 + HTTP GET** — 搬進獨立 `vNetTask`（優先級 2）；W3 `WX?` 抓 wttr.in 天氣；首頁標題列顯示時間+天氣，移除獨立 Clock app
+- [ ] 階段 11.6：W5 下載檔案到 SD（UART+DMA）、給 module 用的網路 syscall ← 之後
 
 ---
 
@@ -113,6 +114,28 @@ Drivers/BSP
 -
 -->
 <!-- ↑↑↑ 複製上面 ↑↑↑ -->
+
+### 2026-08-01 ｜ 網路架構整理 + HTTP GET 抓天氣 + 首頁整合
+
+**目標**：把臨時測試碼收乾淨（獨立 task），並讓手機真的抓網路資料（天氣）。
+
+**做了什麼**：
+- **`vNetTask`**：新增獨立 FreeRTOS task（優先級 2，低於 UI/Input），專職管 ESP32 UART。定期送 `TIME?`/`WX?`、撈 ring buffer 組行解析。`vTaskDelay(20ms)` 輪詢讓出 CPU。`g_time_valid` 旗標控制對時節奏（對到前 3s 重試、對到後 60s 校準）。vUITask 恢復乾淨。
+- **W3 HTTP GET**：ESP32 新增 `WX?` → 用 `HTTPClient` 抓 `wttr.in/Taipei?format=%l:+%t` → 回一行天氣。ESP32 端濾掉非 ASCII（`°` 是 UTF-8 多位元組，STM32 字型只認 ASCII）。
+- **首頁整合**：標題列（海軍藍）排入 Menu(左)｜天氣(黃、中)｜時間(右、每秒跳)。時間邏輯從獨立 Clock app 搬到首頁；APPS[] 移除 CLOCK（剩 5 圖示），main.c 拿掉 `ScreenClock_Register()`。
+
+**遇到的問題**：
+- 天氣顯示 `+33蚓`：度數符號 `°`(UTF-8 0xC2 0xB0) 亂碼 → ESP32 端只留 0x20~0x7E 的 ASCII。
+
+**學到 / 筆記**：
+- 分 task 的價值：把「可能拖很久」（網路傳輸）跟「要即時」（觸控/畫面）用優先級隔開，長傳輸再久也不卡畫面。
+- HAL 是「硬體抽象層」，底下就是戳 SR/DR/CR1；HTTPClient 同理，把 TCP/握手/解析包掉。
+- ISR 只搬 byte 進 ring buffer（快進快出），組行/解析放 task（慢工）。
+- 局部重畫：只塗自己那塊（背景色要對上，標題列是 NAVY），不碰鄰居、不閃爍。
+
+**下一步**：
+- W5 下載檔案到 SD（正好練 UART+DMA）、給 module 用的網路 syscall。
+- （天氣圖案暫不做；OTA/bootloader 使用者暫不需要。）
 
 ### 2026-07-30 ｜ WiFi 起步：ESP32-S3 協處理器 + UART 連線 + NTP 對時
 
