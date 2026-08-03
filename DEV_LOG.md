@@ -115,6 +115,30 @@ Drivers/BSP
 -->
 <!-- ↑↑↑ 複製上面 ↑↑↑ -->
 
+### 2026-08-03 ｜ W5 無線下載到 SD（跑通）+ 堆疊監測 + 踩到 FatFs 併發大坑
+
+**目標**：讓 ESP32 從網路抓檔，透過 UART 傳給 STM32 寫進 SD 卡。
+
+**做了什麼**：
+- **下載協定（chunk + ack 流量控制）**：STM32 送 `DL url` → ESP32 回 `BEGIN` → 迴圈 `C <len>`+裸資料，STM32 收一塊寫一塊回 `A`，直到 `C 0`。每塊自帶長度（不需事先知道總大小，處理 HTTP/1.0 close-delimited）。**STM32 當節拍器**：寫完 SD 才 ack，ESP32 才送下一塊 → ring buffer 不會爆。
+- STM32 端阻塞讀取 helper：`esp_read_line`（收標頭）、`esp_read_bytes`（收裸 byte），沒資料時 `vTaskDelay(1)` 讓出 CPU。
+- 驗證：下載 example.com（559 byte）到 SD 成功。
+- **堆疊監測工具**：`configCHECK_FOR_STACK_OVERFLOW=2` + `vApplicationStackOverflowHook`、`uxTaskGetStackHighWaterMark`（vNetTask 每 15s 印各 task 剩餘水位）。
+- **gb_rom_read 防呆**：檢查 f_lseek/f_read 回傳值，失敗不標記快取（下次重讀）；GB 主迴圈檢查錯誤旗標，出錯顯示 `err/sd` 碼而非無聲空轉。
+
+**遇到的問題（三個真實 bug）**：
+1. ack `"A\n"` 的 `\n` 殘留 → ESP32 收到空指令回 `ERR unknown`。改送單一 `"A"`。
+2. **NetTask 堆疊溢位**：`net_download` 把 `FIL`(~560B)+`buf[512]` 放堆疊 → 2KB 堆疊爆 → 踩爛記憶體 → **下載後觸控死掉**。改成 static + 堆疊加大。
+3. **FatFs 併發踩爛 SD 卡（最大坑）**：下載跑在 NetTask、GB/Photo/Notes 讀 SD 在 UITask，`_FS_REENTRANT=0`（FatFs 非 thread-safe）→ 兩 task 同時碰 FatFs → 踩爛共用視窗緩衝，連**卡上 FAT/目錄項都寫壞**。症狀：Pokémon 卡在開頭、fps 飆幾萬（`gb_rom_read` f_lseek 回 FR_INT_ERR）。chkdsk 抓到 red.gb/gold.gb 大小錯誤 → 重 copy ROM 修復。
+
+**學到 / 筆記**：
+- **FatFs 非 thread-safe**：多 task 存取 SD 必須序列化（下一步加 `sd_mutex`）。共用硬體資源一定要鎖。
+- 大結構（FIL、buffer）放 static 別放 task 堆疊。
+- fps 異常飆高 = 模擬器空轉的訊號，往「資料/讀取錯誤」查。
+- 除錯記憶體：`.su` 檔（-fstack-usage）看每函式堆疊、high-water 看 task 實際用量、溢位 hook 當場攔截。
+
+**下一步**：加 `sd_mutex` 序列化所有 SD 存取 → 才安全重新開放下載（目前 net_download 已定義但停用）。
+
 ### 2026-08-01 ｜ 網路架構整理 + HTTP GET 抓天氣 + 首頁整合
 
 **目標**：把臨時測試碼收乾淨（獨立 task），並讓手機真的抓網路資料（天氣）。

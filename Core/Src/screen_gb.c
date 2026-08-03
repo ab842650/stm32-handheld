@@ -50,6 +50,7 @@ static uint8_t gb_cartram[GB_CARTRAM_MAX];   /* 存檔 RAM 放 SRAM（32KB，CCM
 static FIL     gb_fil;          /* 遊玩期間保持開啟，供 gb_rom_read 換頁 */
 
 static int gb_err_flag;
+static int gb_sd_fail;   /* SD 讀取失敗記錄：fr*1000+br（診斷用）*/
 
 static void gb_cache_reset(void)
 {
@@ -67,10 +68,15 @@ static uint8_t gb_rom_read(struct gb_s *g, const uint_fast32_t addr)
     uint32_t line = addr >> GB_LINE_BITS;              /* 整顆 ROM 的第幾條 512B line */
     uint32_t set  = line & (GB_NLINES - 1);            /* direct-mapped 落在哪一格 */
     if (gb_tag[set] != line) {                         /* miss → 只讀 512B */
-        UINT br;
-        f_lseek(&gb_fil, line << GB_LINE_BITS);
-        f_read(&gb_fil, &gb_cache[set * GB_LINE_SZ], GB_LINE_SZ, &br);
-        gb_tag[set] = line;
+        UINT br = 0;
+        FRESULT fr = f_lseek(&gb_fil, line << GB_LINE_BITS);
+        if (fr == FR_OK)
+            fr = f_read(&gb_fil, &gb_cache[set * GB_LINE_SZ], GB_LINE_SZ, &br);
+        if (fr == FR_OK && br == GB_LINE_SZ) {
+            gb_tag[set] = line;                        /* 只有成功才標記快取有效 */
+        } else {
+            gb_sd_fail = (int)fr * 1000 + (int)br;     /* 失敗記錄，不快取垃圾（下次重讀）*/
+        }
     }
     return gb_cache[set * GB_LINE_SZ + (addr & (GB_LINE_SZ - 1))];
 }
@@ -233,6 +239,7 @@ static void gb_run(const char *romname)
 
     /* 初始化模擬器 */
     gb_err_flag = 0;
+    gb_sd_fail  = 0;
     enum gb_init_error_e e = gb_init(&gb, gb_rom_read, gb_cart_ram_read,
                                      gb_cart_ram_write, gb_error_cb, NULL);
 
@@ -284,6 +291,17 @@ static void gb_run(const char *romname)
     uint32_t fps_n  = 0;
     for (;;) {
         gb_run_frame(&gb);
+
+        /* 診斷：模擬器報錯或 SD 讀取失敗 → 顯示錯誤碼並停下（不再無聲空轉）*/
+        if (gb_err_flag || gb_sd_fail) {
+            char e[40];
+            snprintf(e, sizeof(e), "err=%d sd=%d", gb_err_flag, gb_sd_fail);
+            ILI9341_DrawString(2, 0, e, ILI9341_RED, ILI9341_BLACK);
+            uint16_t wx, wy;                              /* 等點一下再回選單 */
+            while (XPT2046_ReadPixel(&wx, &wy))  vTaskDelay(pdMS_TO_TICKS(30));
+            while (!XPT2046_ReadPixel(&wx, &wy)) vTaskDelay(pdMS_TO_TICKS(30));
+            break;
+        }
 
         uint16_t tx = 0, ty = 0;
         uint8_t  jp = 0xFF;                  /* active-low：0xFF = 全放開 */

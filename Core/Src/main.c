@@ -43,9 +43,11 @@ DMA_HandleTypeDef  hdma_spi1_tx;
 SemaphoreHandle_t  spi_bus_mutex;   /* 保護 SPI1 匯流排 */
 QueueHandle_t      ui_event_queue;  /* InputTask → UITask */
 TaskHandle_t       inputTaskHandle;
+TaskHandle_t       uiTaskHandle;
+TaskHandle_t       netTaskHandle;
 
 /* ── ESP32 UART 接收：中斷 ISR 寫入、task 讀出的環形緩衝區 ── */
-#define ESP_RX_SZ 256
+#define ESP_RX_SZ 1024
 static volatile uint8_t  esp_rx_buf[ESP_RX_SZ];
 static volatile uint16_t esp_rx_head;   /* ISR 寫到哪 */
 static volatile uint16_t esp_rx_tail;   /* task 讀到哪 */
@@ -72,6 +74,9 @@ void vInputTask(void *pvParameters);
 void vNetTask(void *pvParameters);
 static int esp_rx_pop(uint8_t *out);
 static void esp_parse_line(const char *s);
+static int esp_read_line(char *buf, int max, uint32_t timeout_ms);
+static int esp_read_bytes(uint8_t *buf, int count, uint32_t timeout_ms);
+static int net_download(const char *url, const char *path);
 /* USER CODE END PFP */
 
 /**
@@ -107,9 +112,9 @@ int main(void)
     XPT2046_Init(&hspi1);
     myprintf("XPT2046 init done\r\n");
 
-    xTaskCreate(vUITask,    "UITask",    2560, NULL, 3, NULL);   /* 2560 words(10KB)：module 狀態放堆疊，CHIP-8 記憶體 4KB+顯示緩衝 */
+    xTaskCreate(vUITask,    "UITask",    2560, NULL, 3, &uiTaskHandle);   /* 2560 words(10KB)：module 狀態放堆疊，CHIP-8 記憶體 4KB+顯示緩衝 */
     xTaskCreate(vInputTask, "InputTask", 256, NULL, 4, &inputTaskHandle);
-    xTaskCreate(vNetTask,   "NetTask",   512, NULL, 2, NULL);    /* ESP32 UART：對時 + 收指令回話 */
+    xTaskCreate(vNetTask,   "NetTask",   1024, NULL, 2, &netTaskHandle);  /* ESP32 UART：對時/天氣/下載（下載用到 FatFs，堆疊要夠）*/
 
     ScreenHome_Register();
     ScreenCalc_Register();
@@ -418,6 +423,7 @@ void vNetTask(void *pvParameters)
     uint32_t last_wx = 0;
 
     for (;;) {
+
         /* 定期送 TIME?：還沒對到時 3 秒重試，對到後 60 秒校準一次 */
         uint32_t interval = g_time_valid ? 60000 : 3000;
         if (last_q == 0 || HAL_GetTick() - last_q >= interval) {
@@ -443,6 +449,16 @@ void vNetTask(void *pvParameters)
             }
         }
 
+        /* 每 15 秒印一次各 task 的堆疊「歷來最少剩餘」（word 數），用來校準堆疊大小 */
+        static uint32_t last_hw = 0;
+        if (HAL_GetTick() - last_hw >= 15000) {
+            last_hw = HAL_GetTick();
+            myprintf("stack free (words) — UI:%lu Input:%lu Net:%lu\r\n",
+                     (unsigned long)uxTaskGetStackHighWaterMark(uiTaskHandle),
+                     (unsigned long)uxTaskGetStackHighWaterMark(inputTaskHandle),
+                     (unsigned long)uxTaskGetStackHighWaterMark(netTaskHandle));
+        }
+
         vTaskDelay(pdMS_TO_TICKS(20));   /* 20ms 輪詢一次，回話延遲可忽略 */
     }
 }
@@ -456,6 +472,16 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
         vTaskNotifyGiveFromISR(inputTaskHandle, &xHigherPriorityTaskWoken);
         portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
     }
+}
+
+/* FreeRTOS 堆疊溢位 hook — 任何 task 堆疊爆掉時被呼叫（configCHECK_FOR_STACK_OVERFLOW=2）
+ * 立刻印出是哪個 task 並停住，接除錯器即可定位，不會再默默壞掉。 */
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
+{
+    (void)xTask;
+    myprintf("\r\n!!! STACK OVERFLOW: %s !!!\r\n", pcTaskName);
+    taskDISABLE_INTERRUPTS();
+    for (;;) {}
 }
 
 /* UART 接收完成回呼 — HAL 每收到 1 byte 自動呼叫一次
@@ -501,6 +527,89 @@ static void esp_parse_line(const char *s)
         strncpy(g_weather, s + 3, sizeof(g_weather) - 1);
         g_weather[sizeof(g_weather) - 1] = '\0';
     }
+}
+
+/* 阻塞讀一整行（到 \n）進 buf。逾時回 0，成功回 1。 */
+static int esp_read_line(char *buf, int max, uint32_t timeout_ms)
+{
+    uint32_t start = HAL_GetTick();
+    int len = 0;
+    for (;;) {
+        uint8_t c;
+        if (esp_rx_pop(&c)) {
+            if (c == '\n' || c == '\r') {
+                if (len > 0) { buf[len] = '\0'; return 1; }   /* 一行結束 */
+            } else if (len < max - 1) {
+                buf[len++] = c;
+            }
+        } else {
+            if (HAL_GetTick() - start > timeout_ms) return 0;  /* 沒資料太久 → 放棄 */
+            vTaskDelay(pdMS_TO_TICKS(2));
+        }
+    }
+}
+
+/* 阻塞讀剛好 count 個裸 byte 進 buf。逾時回 0，成功回 1。 */
+static int esp_read_bytes(uint8_t *buf, int count, uint32_t timeout_ms)
+{
+    uint32_t start = HAL_GetTick();
+    int got = 0;
+    while (got < count) {
+        uint8_t c;
+        if (esp_rx_pop(&c)) {
+            buf[got++] = c;
+            start = HAL_GetTick();     /* 有進資料 → 重置逾時 */
+        } else if (HAL_GetTick() - start > timeout_ms) {
+            return 0;
+        } else {
+            vTaskDelay(1);             /* 沒資料 → 讓出 CPU，避免忙等害觸控頓 */
+        }
+    }
+    return 1;
+}
+
+/* 下載 url 到 SD 的 path。回傳寫入 byte 數，失敗回負數。
+ * 協定：送 "DL url" → 收 "BEGIN" → 迴圈收 "C <len>"+資料、寫檔、回 "A"，
+ *       直到 "C 0"。每塊自帶長度，不需事先知道總大小。 */
+static int net_download(const char *url, const char *path)
+{
+    char cmd[128];
+    int n = snprintf(cmd, sizeof(cmd), "DL %s\r\n", url);
+    HAL_UART_Transmit(&huart3, (uint8_t *)cmd, n, 200);
+
+    /* 等 BEGIN（跳過殘留的 WX/TIME 舊行）；收到 ERR 代表 ESP32 端失敗 */
+    char line[80];
+    uint32_t t0 = HAL_GetTick();
+    for (;;) {
+        if (!esp_read_line(line, sizeof(line), 10000)) return -1;
+        if (strcmp(line, "BEGIN") == 0) break;
+        if (strcmp(line, "ERR")   == 0) return -2;
+        if (HAL_GetTick() - t0 > 12000) return -1;
+    }
+
+    /* FIL(~550B) 和 buf(512B) 放 static，不佔 NetTask 堆疊（否則會溢位）*/
+    static FIL     f;
+    static uint8_t buf[512];
+    if (f_open(&f, path, FA_CREATE_ALWAYS | FA_WRITE) != FR_OK) return -3;
+
+    int done = 0;
+    for (;;) {
+        /* 讀塊標頭 "C <len>" */
+        if (!esp_read_line(line, sizeof(line), 5000)) { f_close(&f); return -4; }
+        int clen;
+        if (sscanf(line, "C %d", &clen) != 1)         { f_close(&f); return -5; }
+        if (clen == 0) break;                          /* C 0 = 傳完 */
+        if (clen > (int)sizeof(buf))                  { f_close(&f); return -6; }
+
+        /* 讀這塊的裸資料，寫檔，回 ack */
+        if (!esp_read_bytes(buf, clen, 3000))         { f_close(&f); return -7; }
+        UINT bw;
+        f_write(&f, buf, clen, &bw);
+        HAL_UART_Transmit(&huart3, (uint8_t *)"A", 1, 200);   /* ack：單一 byte，不留殘餘換行 */
+        done += clen;
+    }
+    f_close(&f);
+    return done;
 }
 
 /* USER CODE END 4 */
