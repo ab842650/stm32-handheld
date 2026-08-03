@@ -84,7 +84,9 @@ Drivers/BSP
 - [x] 階段 11：**WiFi 連線** — ESP32-S3 當 WiFi 協處理器，STM32 走 USART3(PB10/PB11) 下高階指令
   - W0 單向 TX → W1 雙向 + **中斷接收 ring buffer**（手寫驅動）→ W2 ESP32 上網查 IP → W4 **NTP 對時**
 - [x] 階段 11.5：**架構整理 + HTTP GET** — 搬進獨立 `vNetTask`（優先級 2）；W3 `WX?` 抓 wttr.in 天氣；首頁標題列顯示時間+天氣，移除獨立 Clock app
-- [ ] 階段 11.6：W5 下載檔案到 SD（UART+DMA）、給 module 用的網路 syscall ← 之後
+- [x] 階段 11.6：**W5 無線下載到 SD** — chunk+ack 流量控制協定（已驗證，尚未接 UI）；**SD 併發保護**（FatFs volume 鎖 + 壓力測試證明）
+- [x] 階段 12：**Discord 訊息 App** — ESP32 走 Discord REST API 收發訊息，STM32 端 Messages 畫面 + 首頁未讀徽章
+- [ ] 階段 12.5：螢幕小鍵盤（打任意文字；順便讓 Notes 可寫）、下載接 UI、給 module 用的網路 syscall ← 之後
 
 ---
 
@@ -114,6 +116,34 @@ Drivers/BSP
 -
 -->
 <!-- ↑↑↑ 複製上面 ↑↑↑ -->
+
+### 2026-08-03(續二）｜ Discord 訊息 App —— 這台機器會傳訊息了
+
+**目標**：專案重點是「通訊」，讓掌機能跟 Discord 雙向傳訊息（不是只會抓資料）。
+
+**做了什麼**：
+- **ESP32 ⇄ Discord（REST API）**：bot token + `discord.com/api/v10`，`WiFiClientSecure`(setInsecure) + ArduinoJson 7.x。
+  - 收：ESP32 **自己**每 3 秒 `GET /channels/{id}/messages?after={lastId}`，放進自己的 8 格佇列。第一次用 `?limit=1` 只取基準 ID（否則開機會把歷史訊息全倒出來）；略過 `author.bot`（否則自己送的 3 秒後又收回來，無限自問自答）。
+  - 發：`POST /channels/{id}/messages`，body `{"content": ...}`。
+- **UART 協定擴充**：`MSG?` → `MSG <user>: <text>` / `MSGNONE`；`SEND <text>` → `SENDOK` / `SENDERR`。
+- **STM32 端**：`g_msgs[8][40]` ring buffer + `g_msg_n` / `g_msg_unread`；vNetTask 每秒 `MSG?` 取件（`MSGNONE` 不印，否則 debug 被洗版）；`Msg_Send()` 非阻塞排隊，由 NetTask 送出（按鈕不直接碰 UART，畫面不卡）。
+- **Messages 畫面**（`screen_msg.c`）：最近 8 則、使用者名稱青色/內容白色、3 個預設發送鈕（Hi / OK / **Info** —— Info 會送出開機秒數+目前天氣，證明訊息真的來自這台機器）、送出狀態顯示。
+- **首頁**：第 6 格加 `icon_msg` 信封圖示（手繪 16×16 點陣），右上角**紅色未讀數字徽章**。
+
+**設計取捨**：
+- 用 **REST 輪詢**而非 WebSocket Gateway —— Gateway 對 ESP32 偏重，輪詢 3 秒延遲對聊天完全夠用。
+- **輪詢放 ESP32 自己做**，STM32 只用便宜的 `MSG?` 取件 → 網路節奏(rate limit)由 ESP32 管，兩邊解耦。
+
+**限制（已知）**：
+- 螢幕字型只有 ASCII，**中文訊息會被整個濾掉**。要中文得做點陣中文字庫 + UTF-8 解碼，暫不處理。
+- 一則訊息一行 40 字元，超過截斷。
+- 只能發預設短句 —— 任意文字要等螢幕鍵盤。
+
+**踩到的坑**：
+- Discord Developer Portal 的 **MESSAGE CONTENT INTENT 沒開的話，讀到的 `content` 是空字串**（不會報錯，超難查）。
+- 錯誤碼：401=token 錯、403=bot 沒進伺服器/沒權限、404=頻道 ID 錯。
+
+**下一步**：螢幕小鍵盤（能打任意文字，順便讓 Notes 從唯讀變可寫）。
 
 ### 2026-08-03(續）｜ 修 FatFs 併發：開啟 reentrant volume 鎖
 

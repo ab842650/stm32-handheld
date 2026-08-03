@@ -10,6 +10,7 @@ typedef enum {
       SCREEN_CLOCK,
       SCREEN_NOTES,
       SCREEN_GB,
+      SCREEN_MSG,
       SCREEN_COUNT,
  } screen_id_t;
 

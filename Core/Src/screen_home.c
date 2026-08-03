@@ -12,6 +12,7 @@
 
 extern char              g_weather[];      /* 天氣字串（main.c 由 NetTask 更新）*/
 extern volatile uint32_t g_clock_offset;   /* NTP 對時 offset（main.c）*/
+extern volatile uint8_t  g_msg_unread;     /* 未讀訊息數（main.c）*/
 
 /* 標題列內的排版：Menu 靠左、天氣置中、時間靠右 */
 #define BAR_TY   ((UI_TITLE_H - FONT_HEIGHT) / 2)   /* 標題列內文字的 y（垂直置中）*/
@@ -45,6 +46,7 @@ static const app_entry_t APPS[] = {
     { ILI9341_RED,    icon_photo, "PHOTO", SCREEN_PHOTO },
     { ILI9341_CYAN,   icon_notes, "NOTES", SCREEN_NOTES },
     { ILI9341_MAGENTA, icon_game, "GB",    SCREEN_GB    },
+    { ILI9341_ORANGE, icon_msg,   "MSG",   SCREEN_MSG   },
 };
 #define APP_COUNT  ((int)(sizeof(APPS) / sizeof(APPS[0])))
 
@@ -73,8 +75,27 @@ static void draw_icon(uint16_t x, const app_entry_t *app)
     ILI9341_DrawString(tx, LABEL_Y, app->label, ILI9341_WHITE, ILI9341_BLACK);
 }
 
+/* 未讀徽章：先把 MSG 圖示重畫乾淨，未讀 > 0 再疊一個紅底數字在右上角 */
+static void draw_msg_badge(void)
+{
+    int      i = APP_COUNT - 1;           /* MSG 固定放最後一格 */
+    uint16_t x = app_x(i);
+
+    draw_icon(x, &APPS[i]);
+    if (g_msg_unread > 0) {
+        char b[4];
+        snprintf(b, sizeof(b), "%u", (unsigned)(g_msg_unread > 9 ? 9 : g_msg_unread));
+        uint16_t bw = 14;
+        uint16_t bx = x + ICON_W - bw;
+        ILI9341_FillRect(bx, ICON_Y, bw, FONT_HEIGHT, ILI9341_RED);
+        ILI9341_DrawString(bx + (bw - FONT_WIDTH) / 2, ICON_Y, b,
+                           ILI9341_WHITE, ILI9341_RED);
+    }
+}
+
 static char     wx_shown[48] = "";        /* 上次畫的天氣，判斷有沒有變 */
 static uint32_t tm_shown = 0xFFFFFFFF;    /* 上次畫的秒數 */
+static uint8_t  unread_shown = 0xFF;      /* 上次畫的未讀數 */
 
 static void home_enter(void)
 {
@@ -85,8 +106,9 @@ static void home_enter(void)
     for (int i = 0; i < APP_COUNT; i++)
         draw_icon(app_x(i), &APPS[i]);
 
-    wx_shown[0] = '\0';          /* 進場強制重畫天氣 + 時間 */
+    wx_shown[0] = '\0';          /* 進場強制重畫天氣 + 時間 + 徽章 */
     tm_shown = 0xFFFFFFFF;
+    unread_shown = 0xFF;
 }
 
 static void home_touch(uint16_t x, uint16_t y)
@@ -117,6 +139,12 @@ static void home_render(void)
         /* 清右側再畫（多清 2px 邊，避免殘影）*/
         ILI9341_FillRect(ILI9341_WIDTH - 8 - w - 2, 0, w + 10, UI_TITLE_H, ILI9341_NAVY);
         ILI9341_DrawString(ILI9341_WIDTH - 8 - w, BAR_TY, tb, ILI9341_WHITE, ILI9341_NAVY);
+    }
+
+    /* 未讀訊息徽章：只有數字變了才重畫 */
+    if (g_msg_unread != unread_shown) {
+        unread_shown = g_msg_unread;
+        draw_msg_badge();
     }
 
     /* 天氣（標題列中間）：只有內容變了才重畫 */

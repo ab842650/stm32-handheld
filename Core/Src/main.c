@@ -28,6 +28,7 @@
 #include "screen_clock.h"
 #include "screen_notes.h"
 #include "screen_gb.h"
+#include "screen_msg.h"
 #include "fatfs.h"
 /* USER CODE END Includes */
 
@@ -57,6 +58,16 @@ static uint8_t           esp_rx_byte;   /* HAL 每次收 1 byte 暫存這 */
 volatile uint32_t g_clock_offset = 0;
 volatile uint8_t  g_time_valid   = 0;   /* 已成功對到時 = 1 */
 char              g_weather[48]  = "";  /* 最近一次抓到的天氣字串 */
+
+/* ── Discord 訊息：ring buffer 保留最近 MSG_MAX 則（screen_msg.c 讀）── */
+#define MSG_MAX 8
+#define MSG_LEN 40      /* 螢幕一行剛好 320/8 = 40 字元 */
+char              g_msgs[MSG_MAX][MSG_LEN];
+volatile uint32_t g_msg_n;        /* 已收到的總則數（只增；第 k 則存 g_msgs[k % MSG_MAX]）*/
+volatile uint8_t  g_msg_unread;   /* 未讀數，進 Messages 畫面時歸零 */
+volatile uint8_t  g_send_result;  /* 0=閒置 1=送出中 2=成功 3=失敗 */
+static char       g_send_text[64];/* 待送出的訊息（NetTask 取走）*/
+static volatile uint8_t g_send_req;
 
 /* ── SD 併發壓力測試（驗證 FatFs volume 鎖有效）。已驗證通過，平時設 0；
  *    改回 1 可重跑：兩個 task 狂寫/讀 SD 並逐 byte 驗證，報告在 vNetTask ── */
@@ -144,6 +155,7 @@ int main(void)
     ScreenPhoto_Register();
     ScreenNotes_Register();
     ScreenGB_Register();
+    ScreenMsg_Register();
 
     vTaskStartScheduler();
 
@@ -513,8 +525,9 @@ void vNetTask(void *pvParameters)
 {
     char     line[64];
     uint8_t  len     = 0;
-    uint32_t last_q  = 0;
-    uint32_t last_wx = 0;
+    uint32_t last_q   = 0;
+    uint32_t last_wx  = 0;
+    uint32_t last_msg = 0;
 
     for (;;) {
 
@@ -531,6 +544,21 @@ void vNetTask(void *pvParameters)
             last_wx = HAL_GetTick();
             const char m2[] = "WX?\r\n";
             HAL_UART_Transmit(&huart3, (uint8_t *)m2, sizeof(m2) - 1, 100);
+        }
+
+        /* 有待送訊息就先送（畫面按鈕觸發）*/
+        if (g_send_req) {
+            g_send_req = 0;
+            char cmd[80];
+            int n = snprintf(cmd, sizeof(cmd), "SEND %s\r\n", g_send_text);
+            HAL_UART_Transmit(&huart3, (uint8_t *)cmd, n, 200);
+        }
+
+        /* 每秒問一次有沒有新訊息（ESP32 自己輪詢 Discord，這裡只是便宜地取件）*/
+        if (last_msg == 0 || HAL_GetTick() - last_msg >= 1000) {
+            last_msg = HAL_GetTick();
+            const char m3[] = "MSG?\r\n";
+            HAL_UART_Transmit(&huart3, (uint8_t *)m3, sizeof(m3) - 1, 100);
         }
 
         /* 撈 ring buffer，組行，遇換行就解析 */
@@ -620,6 +648,7 @@ static int esp_rx_pop(uint8_t *out)
 /* 解析一整行 ESP32 回話。目前認得 "TIME HH:MM:SS" → 更新時鐘 offset */
 static void esp_parse_line(const char *s)
 {
+    if (strcmp(s, "MSGNONE") == 0) return;      /* 每秒都會有，不印免得洗版 */
     myprintf("ESP: %s\r\n", s);                 /* debug：印出收到的整行 */
 
     unsigned h, m, sec;
@@ -636,7 +665,32 @@ static void esp_parse_line(const char *s)
     if (strncmp(s, "WX ", 3) == 0) {
         strncpy(g_weather, s + 3, sizeof(g_weather) - 1);
         g_weather[sizeof(g_weather) - 1] = '\0';
+        return;
     }
+
+    /* "MSG <user>: <text>" → 收到一則 Discord 訊息，存進 ring */
+    if (strncmp(s, "MSG ", 4) == 0) {
+        char *slot = g_msgs[g_msg_n % MSG_MAX];
+        strncpy(slot, s + 4, MSG_LEN - 1);
+        slot[MSG_LEN - 1] = '\0';
+        g_msg_n++;
+        if (g_msg_unread < 99) g_msg_unread++;
+        return;
+    }
+
+    /* 送出結果 */
+    if (strcmp(s, "SENDOK")  == 0) { g_send_result = 2; return; }
+    if (strcmp(s, "SENDERR") == 0) { g_send_result = 3; return; }
+}
+
+/* 給畫面用：請求送一則訊息到 Discord（非阻塞，NetTask 會取走送出）*/
+void Msg_Send(const char *text)
+{
+    if (g_send_req) return;                  /* 上一則還沒送完 */
+    strncpy(g_send_text, text, sizeof(g_send_text) - 1);
+    g_send_text[sizeof(g_send_text) - 1] = '\0';
+    g_send_result = 1;                       /* 送出中 */
+    g_send_req    = 1;
 }
 
 /* 阻塞讀一整行（到 \n）進 buf。逾時回 0，成功回 1。 */
