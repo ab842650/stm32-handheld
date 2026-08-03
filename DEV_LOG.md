@@ -115,6 +115,22 @@ Drivers/BSP
 -->
 <!-- ↑↑↑ 複製上面 ↑↑↑ -->
 
+### 2026-08-03(續）｜ 修 FatFs 併發：開啟 reentrant volume 鎖
+
+**目標**：讓多個 task 存取 SD 不再踩爛（前一則的大坑），才能安全重開下載。
+
+**做了什麼**：
+- 開 FatFs 內建的 volume 鎖(`_FS_REENTRANT=1`)而非手動在 11 個 call site 加鎖 —— FatFs 會**自動在每個 `f_*` 進出上鎖/解鎖**，一個都不會漏、call site 零修改。
+- `ffconf.h`：`_FS_REENTRANT 1`、`_SYNC_t = SemaphoreHandle_t`、include FreeRTOS.h/semphr.h。
+- `option/syscall.c`：4 個 sync 函式(ff_cre/del_syncobj、ff_req/rel_grant)從 CMSIS-RTOS 改成原生 FreeRTOS(`xSemaphoreCreateMutex/Take/Give`)。
+- 時序確認：volume mutex 在 `f_mount` 建立，而 f_mount 在 `SD_SelfTest`(vUITask，排程器啟動後)才跑 → 安全。
+
+**學到 / 筆記**：
+- FatFs 本來就有 thread-safe 機制，只是預設關；用它比手動包鎖更不易出錯。
+- 每個 `f_*` 各自上鎖(非整段)，所以下載中 GB/UI 的 SD 存取仍能在安全點交錯，不互卡。
+
+**下一步**：把 net_download 接到 UI(手動觸發下載)，並在下載中同時操作 SD 驗證卡不再被踩壞。
+
 ### 2026-08-03 ｜ W5 無線下載到 SD（跑通）+ 堆疊監測 + 踩到 FatFs 併發大坑
 
 **目標**：讓 ESP32 從網路抓檔，透過 UART 傳給 STM32 寫進 SD 卡。

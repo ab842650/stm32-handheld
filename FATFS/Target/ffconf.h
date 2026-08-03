@@ -237,9 +237,11 @@
 /      can be opened simultaneously under file lock control. Note that the file
 /      lock control is independent of re-entrancy. */
 
-#define _FS_REENTRANT    0  /* 0:Disable or 1:Enable */
+#define _FS_REENTRANT    1  /* 0:Disable or 1:Enable —— 開啟：FatFs 自動在每個 f_* 上鎖 */
 #define _FS_TIMEOUT      1000 /* Timeout period in unit of time ticks */
-#define _SYNC_t          NULL
+#include "FreeRTOS.h"
+#include "semphr.h"
+#define _SYNC_t          SemaphoreHandle_t   /* 用 FreeRTOS mutex 當 volume 鎖 */
 /* The option _FS_REENTRANT switches the re-entrancy (thread safe) of the FatFs
 /  module itself. Note that regardless of this option, file access to different
 /  volume is always re-entrant and volume control functions, f_mount(), f_mkfs()
