@@ -226,7 +226,9 @@
 /  _NORTC_MDAY and _NORTC_YEAR have no effect.
 /  These options have no effect at read-only configuration (_FS_READONLY = 1). */
 
-#define _FS_LOCK    2     /* 0:Disable or >=1:Enable */
+#define _FS_LOCK    6     /* 0:Disable or >=1:Enable —— 同時可開檔數。2 太少：
+                             GB 遊玩時 gb_fil 常駐佔 1，再加下載/Photo/Notes 就爆
+                             （FR_TOO_MANY_OPEN_FILES=18）。每個名額僅 8 bytes。 */
 /* The option _FS_LOCK switches file lock function to control duplicated file open
 /  and illegal operation to open objects. This option must be 0 when _FS_READONLY
 /  is 1.

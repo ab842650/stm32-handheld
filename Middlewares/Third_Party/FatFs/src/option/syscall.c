@@ -70,11 +70,26 @@ int ff_del_syncobj (	/* 1:Function succeeded, 0:Could not delete due to any erro
 /  When a 0 is returned, the file function fails with FR_TIMEOUT.
 */
 
+/* 診斷計數器（驗證 volume 鎖是否真的生效；測完可移除）
+ *   ff_lock_n    ：f_* 成功取得 volume 鎖的次數
+ *   ff_contend_n ：取鎖時鎖已被別的 task 持有 → 真實併發被序列化的次數 */
+volatile unsigned long ff_lock_n;
+volatile unsigned long ff_contend_n;
+
 int ff_req_grant (	/* 1:Got a grant to access the volume, 0:Could not get a grant */
 	_SYNC_t sobj	/* Sync object to wait */
 )
 {
-    return (xSemaphoreTake(sobj, _FS_TIMEOUT) == pdTRUE) ? 1 : 0;
+    if (xSemaphoreTake(sobj, 0) == pdTRUE) {   /* 立刻拿到 → 沒有競爭 */
+        ff_lock_n++;
+        return 1;
+    }
+    ff_contend_n++;                             /* 拿不到 → 別的 task 正在用 FatFs */
+    if (xSemaphoreTake(sobj, _FS_TIMEOUT) == pdTRUE) {
+        ff_lock_n++;
+        return 1;
+    }
+    return 0;
 }
 
 

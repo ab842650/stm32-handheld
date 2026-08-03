@@ -57,6 +57,20 @@ static uint8_t           esp_rx_byte;   /* HAL 每次收 1 byte 暫存這 */
 volatile uint32_t g_clock_offset = 0;
 volatile uint8_t  g_time_valid   = 0;   /* 已成功對到時 = 1 */
 char              g_weather[48]  = "";  /* 最近一次抓到的天氣字串 */
+
+/* ── SD 併發壓力測試（驗證 FatFs volume 鎖有效）。已驗證通過，平時設 0；
+ *    改回 1 可重跑：兩個 task 狂寫/讀 SD 並逐 byte 驗證，報告在 vNetTask ── */
+#define SD_STRESS_TEST 0
+#if SD_STRESS_TEST
+extern volatile unsigned long ff_lock_n, ff_contend_n;   /* syscall.c 的鎖計數器 */
+#define SDST_BUF 128
+static const int sdst_id[2] = { 0, 1 };
+static FIL       sdst_fil[2];                    /* FIL 很大，放 static 不佔堆疊 */
+static uint8_t   sdst_wbuf[2][SDST_BUF];
+static uint8_t   sdst_rbuf[2][SDST_BUF];
+static volatile uint32_t sdst_iter[2], sdst_fail[2], sdst_lastbad[2];
+static volatile uint32_t sdst_mism[2], sdst_tmo[2], sdst_lastfr[2];
+#endif
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -77,6 +91,9 @@ static void esp_parse_line(const char *s);
 static int esp_read_line(char *buf, int max, uint32_t timeout_ms);
 static int esp_read_bytes(uint8_t *buf, int count, uint32_t timeout_ms);
 static int net_download(const char *url, const char *path);
+#if SD_STRESS_TEST
+void vSdStressTask(void *pvParameters);
+#endif
 /* USER CODE END PFP */
 
 /**
@@ -115,6 +132,11 @@ int main(void)
     xTaskCreate(vUITask,    "UITask",    2560, NULL, 3, &uiTaskHandle);   /* 2560 words(10KB)：module 狀態放堆疊，CHIP-8 記憶體 4KB+顯示緩衝 */
     xTaskCreate(vInputTask, "InputTask", 256, NULL, 4, &inputTaskHandle);
     xTaskCreate(vNetTask,   "NetTask",   1024, NULL, 2, &netTaskHandle);  /* ESP32 UART：對時/天氣/下載（下載用到 FatFs，堆疊要夠）*/
+#if SD_STRESS_TEST
+    /* 兩個同優先級的 task 同時狂寫/讀 SD → 逼出 FatFs 併發，驗證 volume 鎖 */
+    xTaskCreate(vSdStressTask, "SDStress1", 1024, (void *)&sdst_id[0], 1, NULL);
+    xTaskCreate(vSdStressTask, "SDStress2", 1024, (void *)&sdst_id[1], 1, NULL);
+#endif
 
     ScreenHome_Register();
     ScreenCalc_Register();
@@ -406,6 +428,78 @@ void vInputTask(void *pvParameters)
     }
 }
 
+#if SD_STRESS_TEST
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * vSdStressTask — 暫時：SD 併發壓力測試（驗證 FatFs volume 鎖真的有效）
+ *
+ * 兩個同優先級的 task 各自「寫一個可驗證 pattern → 讀回來 → 逐 byte 比對」。
+ * 同優先級 + 時間片輪轉 → 會在 f_* 中途被切走 → 逼出真實的 FatFs 併發。
+ * 沒有鎖的話：共用的 FATFS 視窗緩衝被踩爛 → 讀回內容錯 or FR_ 錯誤 → fail++
+ * 有鎖的話  ：存取被序列化 → fail 永遠 0，而 ff_contend_n 會持續增加。
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+void vSdStressTask(void *pvParameters)
+{
+    int  id = *(const int *)pvParameters;        /* 0 或 1 */
+    char path[16];
+    snprintf(path, sizeof(path), "/STRESS%d.TXT", id + 1);
+
+    /* 暖身：f_mount 在 SD_SelfTest(vUITask) 才做，等掛載完成再開始計數，
+     * 否則開頭那幾十次「還沒掛載」的失敗會混進統計裡。 */
+    for (;;) {
+        FRESULT fr = f_open(&sdst_fil[id], path, FA_CREATE_ALWAYS | FA_WRITE);
+        if (fr == FR_OK) { f_close(&sdst_fil[id]); break; }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    for (;;) {
+        uint32_t n   = sdst_iter[id];
+        int      bad = 0;
+        FRESULT  fr  = FR_OK;
+        UINT     bw = 0, br = 0;
+
+        /* 依 (id, 第幾輪) 產生可驗證的 pattern */
+        for (int i = 0; i < SDST_BUF; i++)
+            sdst_wbuf[id][i] = (uint8_t)(id * 71 + n * 13 + i);
+
+        /* 寫 */
+        fr = f_open(&sdst_fil[id], path, FA_CREATE_ALWAYS | FA_WRITE);
+        if (fr != FR_OK) {
+            bad = 1;
+        } else {
+            fr = f_write(&sdst_fil[id], sdst_wbuf[id], SDST_BUF, &bw);
+            if (fr != FR_OK || bw != SDST_BUF) bad = 2;
+            f_close(&sdst_fil[id]);
+        }
+        /* 讀回 */
+        if (!bad) {
+            memset(sdst_rbuf[id], 0, SDST_BUF);
+            fr = f_open(&sdst_fil[id], path, FA_READ);
+            if (fr != FR_OK) {
+                bad = 3;
+            } else {
+                fr = f_read(&sdst_fil[id], sdst_rbuf[id], SDST_BUF, &br);
+                if (fr != FR_OK || br != SDST_BUF) bad = 4;
+                f_close(&sdst_fil[id]);
+            }
+        }
+        /* 驗證：寫進去的 == 讀出來的（這一項才是「資料損壞」）*/
+        if (!bad && memcmp(sdst_wbuf[id], sdst_rbuf[id], SDST_BUF) != 0) {
+            bad = 5;
+            sdst_mism[id]++;                    /* ← 損壞計數，必須永遠 0 */
+        }
+
+        if (bad) {
+            sdst_fail[id]++;
+            sdst_lastbad[id] = bad;
+            sdst_lastfr[id]  = (uint32_t)fr;
+            if (fr == FR_TIMEOUT) sdst_tmo[id]++;   /* 排隊等太久（非損壞）*/
+        }
+        sdst_iter[id]++;
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+}
+#endif
+
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * vNetTask — 管 ESP32 UART：對時 + 收指令回話
  *
@@ -448,6 +542,22 @@ void vNetTask(void *pvParameters)
                 line[len++] = rx;
             }
         }
+
+#if SD_STRESS_TEST
+        /* SD 併發壓力測試回報：fail 必須永遠 0，contend 必須 > 0（代表真的併發過）*/
+        static uint32_t last_st = 0;
+        if (HAL_GetTick() - last_st >= 2000) {
+            last_st = HAL_GetTick();
+            myprintf("SD stress: iter=%lu/%lu MISMATCH=%lu/%lu fail=%lu/%lu tmo=%lu/%lu "
+                     "lastfr=%lu/%lu  lock=%lu contend=%lu\r\n",
+                     (unsigned long)sdst_iter[0], (unsigned long)sdst_iter[1],
+                     (unsigned long)sdst_mism[0], (unsigned long)sdst_mism[1],
+                     (unsigned long)sdst_fail[0], (unsigned long)sdst_fail[1],
+                     (unsigned long)sdst_tmo[0],  (unsigned long)sdst_tmo[1],
+                     (unsigned long)sdst_lastfr[0], (unsigned long)sdst_lastfr[1],
+                     ff_lock_n, ff_contend_n);
+        }
+#endif
 
         /* 每 15 秒印一次各 task 的堆疊「歷來最少剩餘」（word 數），用來校準堆疊大小 */
         static uint32_t last_hw = 0;
