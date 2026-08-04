@@ -21,8 +21,13 @@ music/
 tools/*.jpg
 tools/*.bmp
 
+# 憑證：WiFi 密碼 + Discord bot token，絕不進版控
+# （範本是 esp32/wifi_bridge/secrets.h.example，那個要進版控）
+esp32/*/secrets.h
+
 # IDE / 本機
 .claude/
+.settings/language.settings.xml
 *.launch
 lab5.ioc.bak
 .DS_Store

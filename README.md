@@ -73,10 +73,11 @@ in **[DEV_LOG.md](DEV_LOG.md)**.
 ## Repository layout
 
 ```
-Core/            main.c, screens (home/calc/clock/notes/photo/game/gb), drivers glue
+Core/            main.c, screens (home/calc/notes/photo/game/gb/msg/keyboard), drivers glue
 Drivers/BSP/     ili9341.c/.h, xpt2046.c/.h  (hand-written)
 Middlewares/     FatFs, TJpgDec (JPEG), Peanut-GB (Game Boy)
 FATFS/           SD-over-SPI glue (diskio)
+esp32/           ESP32-S3 WiFi co-processor firmware (Arduino) — see esp32/README.md
 tools/           Python asset generators; module/ = position-independent .bin build
 STM32F407VGTX_FLASH.ld   linker script (reserved regions, CCM sections)
 ```

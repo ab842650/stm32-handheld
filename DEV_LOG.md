@@ -154,7 +154,17 @@ Drivers/BSP
 - ESP32 端的 `DL <url>` 保留（不佔 STM32 資源），要復原 STM32 端就 `git show c04cb1b -- Core/Src/main.c`。
 - NetTask 堆疊維持 1024 words。當初是為了 `net_download` 裡的 `FIL`+512B buffer 從 512 加上去的，現在高水位量到只用 ~260 words，但先留餘裕不動它。
 
-**下一步**：待定。剩下的想法：選單捲動（>6 ROM）、中文顯示、錄 demo 影片。
+**ESP32 韌體終於進版控**：在此之前 `sketch_jul30a.ino` 一直躺在 `Documents\Arduino`，**完全沒有版控** —— 代表這個專案沒辦法從 repo 重建，WiFi/NTP/天氣/Discord 有一半的實作不在裡面，也看不出「ESP32 當協處理器」這個架構決定。搬進 `esp32/wifi_bridge/`。
+
+- **憑證拆成 `secrets.h`**（WiFi 帳密 + Discord bot token），加進 `.gitignore`；`secrets.h.example` 才進版控。
+- 順序很重要：**先加 gitignore 規則 → `git check-ignore` 驗證 → 才寫入真的憑證**。反過來做就有一個「真 token 可能被 `git add .` 掃進去」的空窗。
+- 確認過 git 歷史裡從來沒出現過那組 token（因為 sketch 一直在 repo 外面，反而躲掉了）。
+- 寫了 `esp32/README.md`：接線表、完整協定表、設定步驟、踩過的坑（**USB CDC On Boot 要 Disabled**、**ArduinoJson 必須 7.x**、**MESSAGE CONTENT INTENT 沒開會靜默回空字串**）。
+- 順手把 `.settings/language.settings.xml` 從版控移除（CubeIDE 每次都會亂改，一直掛在 `git status` 上）。
+
+⚠️ 從現在起 Arduino IDE 要開 **repo 裡的** `esp32/wifi_bridge/`，不是 `Documents\Arduino\sketch_jul30a`。
+
+**下一步**：README 補上整條 WiFi/Discord/併發線（目前 README 還停在 Game Boy 階段），然後錄 demo 影片。
 
 ### 2026-08-03(續二）｜ Discord 訊息 App —— 這台機器會傳訊息了
 
