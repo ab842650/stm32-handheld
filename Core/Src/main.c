@@ -29,6 +29,7 @@
 #include "screen_notes.h"
 #include "screen_gb.h"
 #include "screen_msg.h"
+#include "screen_kb.h"
 #include "fatfs.h"
 /* USER CODE END Includes */
 
@@ -156,6 +157,7 @@ int main(void)
     ScreenNotes_Register();
     ScreenGB_Register();
     ScreenMsg_Register();
+    ScreenKb_Register();
 
     vTaskStartScheduler();
 

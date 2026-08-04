@@ -1,5 +1,6 @@
 #include "screen.h"
 #include "screen_msg.h"
+#include "screen_kb.h"
 #include "ili9341.h"
 #include "ui.h"
 #include "font.h"
@@ -14,7 +15,7 @@
  * 收：ESP32 每 3 秒輪詢 Discord，把新訊息放進它的佇列；vNetTask 每秒用
  *     "MSG?" 取件，存進 g_msgs[] ring buffer。這裡只負責顯示。
  * 發：按預設按鈕 → Msg_Send() 排入待送 → vNetTask 送 "SEND <text>"。
- *     （任意文字要等螢幕鍵盤做好）
+ *     按 Type → 打開螢幕鍵盤（screen_kb），打完 Send 才回呼到這裡送出。
  *
  * 重畫策略跟時鐘/天氣一樣：只有「總則數」或「送出狀態」變了才重畫，
  * 否則每個 UI tick 都畫會閃。
@@ -33,7 +34,7 @@ void Msg_Send(const char *text);
 #define MSG_Y   36                        /* 訊息列表起始 y */
 #define BTN_Y   170                       /* 預設按鈕列 y */
 #define BTN_H   34
-#define BTN_N   3
+#define BTN_N   4
 
 typedef struct {
     uint16_t    x, w;
@@ -42,9 +43,10 @@ typedef struct {
 } msgbtn_t;
 
 static const msgbtn_t BTNS[BTN_N] = {
-    {   8, 96, ILI9341_BLUE,   "Hi"   },
-    { 112, 96, ILI9341_GREEN,  "OK"   },
-    { 216, 96, ILI9341_ORANGE, "Info" },
+    {   4, 72, ILI9341_BLUE,    "Hi"   },
+    {  84, 72, ILI9341_GREEN,   "OK"   },
+    { 164, 72, ILI9341_ORANGE,  "Info" },
+    { 244, 72, ILI9341_MAGENTA, "Type" },
 };
 
 static uint32_t shown_n;        /* 上次畫出時的總則數 */
@@ -125,6 +127,13 @@ static void msg_enter(void)
     shown_send   = 0xFF;
 }
 
+/* 鍵盤按下 Send 後的回呼（此時鍵盤已經 pop 掉，我們又是最上層畫面）*/
+static void kb_done(const char *text)
+{
+    if (text != NULL && text[0] != '\0')
+        Msg_Send(text);
+}
+
 static void msg_touch(uint16_t x, uint16_t y)
 {
     if (UI_BackTouched(x, y)) { Screen_Pop(); return; }
@@ -138,13 +147,16 @@ static void msg_touch(uint16_t x, uint16_t y)
             Msg_Send("Hi from the STM32 handheld!");
         } else if (i == 1) {
             Msg_Send("OK");
-        } else {
+        } else if (i == 2) {
             /* 帶上裝置實際狀態，證明訊息真的來自這台機器 */
             uint32_t up = xTaskGetTickCount() / configTICK_RATE_HZ;
             char info[64];
             snprintf(info, sizeof(info), "up %lus | %s",
                      (unsigned long)up, g_weather[0] ? g_weather : "no weather");
             Msg_Send(info);
+        } else {
+            /* 鍵盤按 Send 才會回呼 kb_done；按 Back 就什麼都不做 */
+            Keyboard_Open("Message", "", kb_done);
         }
         return;
     }

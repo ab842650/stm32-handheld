@@ -1,5 +1,6 @@
 #include "screen.h"
 #include "screen_notes.h"
+#include "screen_kb.h"
 #include "ili9341.h"
 #include "ui.h"
 #include "font.h"
@@ -12,7 +13,11 @@
  *
  * 兩種模式：LIST（檔案清單）/ VIEW（看內文）。
  *   LIST：點檔名 → 進 VIEW；點 Back → 回主選單
- *   VIEW：點 Back → 回 LIST
+ *   VIEW：左軟鍵 Add → 螢幕鍵盤，打完 Send 就把該行 append 進檔案
+ *         點 Back → 回 LIST
+ *
+ * 寫入是在 UITask 裡直接呼叫 f_open/f_write —— 現在安全，因為 FatFs 已經
+ * 開了 volume 重入鎖（ffconf.h `_FS_REENTRANT`），跟 NetTask 撞到會自動排隊。
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 
 #define NOTES_DIR    "/NOTES"
@@ -24,7 +29,10 @@
 static char notes_list[NOTES_MAX][13];   /* 8.3 檔名 */
 static int  notes_count;
 static int  notes_mode;                  /* 0=LIST，1=VIEW */
+static int  notes_cur = -1;              /* VIEW 中的檔案索引（給 Add 用）*/
 static char notebuf[NOTES_BUFSZ];        /* 內文（.bss，不佔 stack）*/
+
+static void view_file(int idx);
 
 static int is_txt(const char *name)
 {
@@ -83,7 +91,8 @@ static void view_file(int idx)
     if (dot) *dot = 0;
 
     notes_mode = 1;
-    UI_DrawFrame(title, NULL, "Back");
+    notes_cur  = idx;
+    UI_DrawFrame(title, "Add", "Back");
 
     FIL  fil;
     UINT br = 0;
@@ -100,16 +109,52 @@ static void view_file(int idx)
                        ILI9341_WHITE, ILI9341_BLACK);
 }
 
+/* 鍵盤按 Send 的回呼：把這一行接到目前檔案尾端，再重新載入顯示 */
+static void note_append(const char *text)
+{
+    if (notes_cur < 0 || text == NULL || text[0] == '\0') return;
+
+    char path[32];
+    strcpy(path, NOTES_DIR "/");
+    strcat(path, notes_list[notes_cur]);
+
+    FIL  fil;
+    UINT bw;
+    if (f_open(&fil, path, FA_WRITE | FA_OPEN_APPEND) != FR_OK) {
+        UI_DrawCentered(UI_SOFT_Y - 20, "write failed",
+                        ILI9341_RED, ILI9341_BLACK);
+        return;
+    }
+    f_write(&fil, text, (UINT)strlen(text), &bw);
+    f_write(&fil, "\n", 1, &bw);
+    f_close(&fil);                              /* close 才會把 FAT 寫回卡上 */
+
+    view_file(notes_cur);                       /* 重讀，讓新的一行馬上看到 */
+}
+
 static void notes_enter(void)
 {
     notes_count = scan_txt();
-    draw_list();
+    /* 從鍵盤 pop 回來時 Screen 會再呼叫一次 on_enter；
+     * 若剛才在 VIEW，就回到 VIEW 而不是彈回清單。 */
+    if (notes_mode == 1 && notes_cur >= 0 && notes_cur < notes_count)
+        view_file(notes_cur);
+    else
+        draw_list();
 }
 
 static void notes_touch(uint16_t x, uint16_t y)
 {
-    if (notes_mode == 1) {                      /* VIEW：Back 回清單 */
-        if (UI_BackTouched(x, y)) draw_list();
+    if (notes_mode == 1) {                      /* VIEW */
+        if (UI_BackTouched(x, y)) { notes_cur = -1; draw_list(); return; }
+        /* 左軟鍵 Add */
+        if (y >= UI_SOFT_Y && x < ILI9341_WIDTH / 2) {
+            char t[13];
+            strcpy(t, notes_list[notes_cur]);
+            char *dot = strrchr(t, '.');
+            if (dot) *dot = 0;
+            Keyboard_Open(t, "", note_append);
+        }
         return;
     }
     /* LIST */

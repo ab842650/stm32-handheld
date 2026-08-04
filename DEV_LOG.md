@@ -86,7 +86,9 @@ Drivers/BSP
 - [x] 階段 11.5：**架構整理 + HTTP GET** — 搬進獨立 `vNetTask`（優先級 2）；W3 `WX?` 抓 wttr.in 天氣；首頁標題列顯示時間+天氣，移除獨立 Clock app
 - [x] 階段 11.6：**W5 無線下載到 SD** — chunk+ack 流量控制協定（已驗證，尚未接 UI）；**SD 併發保護**（FatFs volume 鎖 + 壓力測試證明）
 - [x] 階段 12：**Discord 訊息 App** — ESP32 走 Discord REST API 收發訊息，STM32 端 Messages 畫面 + 首頁未讀徽章
-- [ ] 階段 12.5：螢幕小鍵盤（打任意文字；順便讓 Notes 可寫）、下載接 UI、給 module 用的網路 syscall ← 之後
+- [x] 階段 12.5：**螢幕小鍵盤**（共用元件 `screen_kb.c`）— Messages 能打任意文字；**Notes 從唯讀變可寫**
+- [ ] 階段 12.6：下載接 UI、給 module 用的網路 syscall ← 之後
+- [ ] 階段 12.7：中文顯示（SD 點陣字庫 + UTF-8）← 已評估，暫緩
 
 ---
 
@@ -116,6 +118,38 @@ Drivers/BSP
 -
 -->
 <!-- ↑↑↑ 複製上面 ↑↑↑ -->
+
+### 2026-08-04 ｜ 螢幕小鍵盤（共用元件）+ Notes 變成可寫
+
+**目標**：Messages 只能發 3 句預設，這是「真的能聊天」唯一的阻礙。做一個鍵盤，而且要能被其他畫面重複使用。
+
+**做了什麼**：
+- 新增 `screen_kb.c` / `screen_kb.h`，一個獨立畫面 `SCREEN_KB`。對外只有一個 API：
+  ```c
+  Keyboard_Open(title, initial, on_done_cb);   /* push 到呼叫者上面 */
+  ```
+- **版面**：文字框（y=32, h=36，游標 500ms 閃）+ 4 列鍵（32×34px，y=70/104/138/172）+ 軟鍵列 Back。
+- **三個 layer**（小寫 / 大寫 / 數字符號）用 `ROWS[3][3]` 字串表定義，切 layer 只是換一組資料。
+- Shift 打完一個字自動回小寫（跟手機一樣）；`123`/`ABC` 切數字層；`<=` 退格。
+- **接進 Messages**：第 4 顆按鈕 `Type`。
+- **接進 Notes**：VIEW 模式左軟鍵 `Add` → 打完 Send 就 `f_open(FA_WRITE|FA_OPEN_APPEND)` + `f_write` 接到檔尾，重讀顯示。**Notes 從唯讀變可寫。**
+
+**設計取捨**：
+- **回呼順序：先 `Screen_Pop()` 再 `cb(text)`。** 反過來也能動，但 callback 裡若想再 `Screen_Push`（例如打完字跳確認頁），就會疊在還沒 pop 的鍵盤上面，堆疊順序亂掉。先 pop 讓 callback 拿到乾淨狀態。
+- **繪圖與命中判定共用 `key_x(row, i)`** —— 跟 `screen_home` 的 `app_x()` 同一招。畫面和觸控區域不可能對不上，因為是同一個函式算的。
+- **不用處理連發**：`vInputTask` 一次按壓只送一個事件（按下→送→等放開→清假通知），按住不放不會連續輸入。這是當初為了 XPT2046 PENIRQ 自我觸發做的設計，這裡白賺。
+- 換 layer 時**整列先清乾淨再畫**：符號層第 2 列只有 6 鍵、小寫層 7 鍵，不清會留殘字。
+- `KB_MAX 60`，剛好塞得進 `g_send_text[64]` 與 `cmd[80]`（`"SEND " + 60 + "\r\n"`）。
+
+**為什麼現在才敢讓 Notes 寫 SD**：`f_write` 跑在 UITask，NetTask 也可能同時碰 SD。這在上次開 `_FS_REENTRANT` 之前會直接踩壞檔案系統（就是寶可夢卡開頭那次）。現在 FatFs volume 鎖會自動排隊，才敢做。
+
+**順手評估了中文（結論：暫緩）**：
+- **顯示不難**。16×16 點陣字，用 **Unicode CJK 區間 U+4E00–U+9FFF** 做成 SD 上的字型檔，`offset = (cp - 0x4E00) * 32` 純算術索引，656 KB，不需要 Big5 對照表。再抄 `gb_cache` 做個 128 格 glyph 快取（4 KB RAM），`DrawString` 改成變寬（ASCII 前進 8、中文前進 16）。
+- 目前 flash 只用了 **136 KB / 1 MB**，塞 flash 也行，但會吃掉 loader 的空間，放 SD 較合理。
+- **難的是輸入法**：注音→候選字字典又大又雜。繞路方案是「ESP32 當 IME 後端」（`IME <注音>` → `IMC <候選字>`），字典放它的 flash。
+- 決定先不做。
+
+**下一步**：下載接 UI、給 module 用的網路 syscall。
 
 ### 2026-08-03(續二）｜ Discord 訊息 App —— 這台機器會傳訊息了
 
