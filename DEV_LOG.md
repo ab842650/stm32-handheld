@@ -84,11 +84,10 @@ Drivers/BSP
 - [x] 階段 11：**WiFi 連線** — ESP32-S3 當 WiFi 協處理器，STM32 走 USART3(PB10/PB11) 下高階指令
   - W0 單向 TX → W1 雙向 + **中斷接收 ring buffer**（手寫驅動）→ W2 ESP32 上網查 IP → W4 **NTP 對時**
 - [x] 階段 11.5：**架構整理 + HTTP GET** — 搬進獨立 `vNetTask`（優先級 2）；W3 `WX?` 抓 wttr.in 天氣；首頁標題列顯示時間+天氣，移除獨立 Clock app
-- [x] 階段 11.6：**W5 無線下載到 SD** — chunk+ack 流量控制協定（已驗證，尚未接 UI）；**SD 併發保護**（FatFs volume 鎖 + 壓力測試證明）
+- [x] 階段 11.6：**SD 併發保護**（FatFs volume 鎖 + 壓力測試證明）。W5 無線下載（chunk+ack 協定）驗證過，但一直沒接 UI，**已移除**（見 2026-08-04）
 - [x] 階段 12：**Discord 訊息 App** — ESP32 走 Discord REST API 收發訊息，STM32 端 Messages 畫面 + 首頁未讀徽章
 - [x] 階段 12.5：**螢幕小鍵盤**（共用元件 `screen_kb.c`）— Messages 能打任意文字；**Notes 從唯讀變可寫**
-- [ ] 階段 12.6：下載接 UI、給 module 用的網路 syscall ← 之後
-- [ ] 階段 12.7：中文顯示（SD 點陣字庫 + UTF-8）← 已評估，暫緩
+- [ ] 階段 12.6：中文顯示（SD 點陣字庫 + UTF-8）← 已評估，暫緩
 
 ---
 
@@ -149,7 +148,13 @@ Drivers/BSP
 - **難的是輸入法**：注音→候選字字典又大又雜。繞路方案是「ESP32 當 IME 後端」（`IME <注音>` → `IMC <候選字>`），字典放它的 flash。
 - 決定先不做。
 
-**下一步**：下載接 UI、給 module 用的網路 syscall。
+**順手清掉 `net_download`**：W5 那套 chunk+ack 下載協定驗證過能用，但一直沒接到任何 UI 動作，留著只換來一個未使用警告。連同只有它在用的 `esp_read_line` / `esp_read_bytes` 一起移除。
+
+- 檢查過**沒有任何 module 需要網路** —— syscall 表只有 `fill_rect / draw_str / delay_ms / is_touched / read_file / list_dir`，現有的 hello / snake / tetris / chip8 都用不到。所以「給 module 的網路 syscall」也從待辦拿掉，不是有東西在等它。
+- ESP32 端的 `DL <url>` 保留（不佔 STM32 資源），要復原 STM32 端就 `git show c04cb1b -- Core/Src/main.c`。
+- NetTask 堆疊維持 1024 words。當初是為了 `net_download` 裡的 `FIL`+512B buffer 從 512 加上去的，現在高水位量到只用 ~260 words，但先留餘裕不動它。
+
+**下一步**：待定。剩下的想法：選單捲動（>6 ROM）、中文顯示、錄 demo 影片。
 
 ### 2026-08-03(續二）｜ Discord 訊息 App —— 這台機器會傳訊息了
 

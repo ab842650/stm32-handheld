@@ -100,9 +100,9 @@ void vInputTask(void *pvParameters);
 void vNetTask(void *pvParameters);
 static int esp_rx_pop(uint8_t *out);
 static void esp_parse_line(const char *s);
-static int esp_read_line(char *buf, int max, uint32_t timeout_ms);
-static int esp_read_bytes(uint8_t *buf, int count, uint32_t timeout_ms);
-static int net_download(const char *url, const char *path);
+/* net_download()（W5 無線下載到 SD）連同 esp_read_line/esp_read_bytes 已移除。
+ * 協定驗證過可用但一直沒接到 UI，留著只是未使用警告。
+ * ESP32 端的 "DL <url>" 仍在，要復原就 git show c04cb1b -- Core/Src/main.c */
 #if SD_STRESS_TEST
 void vSdStressTask(void *pvParameters);
 #endif
@@ -143,7 +143,7 @@ int main(void)
 
     xTaskCreate(vUITask,    "UITask",    2560, NULL, 3, &uiTaskHandle);   /* 2560 words(10KB)：module 狀態放堆疊，CHIP-8 記憶體 4KB+顯示緩衝 */
     xTaskCreate(vInputTask, "InputTask", 256, NULL, 4, &inputTaskHandle);
-    xTaskCreate(vNetTask,   "NetTask",   1024, NULL, 2, &netTaskHandle);  /* ESP32 UART：對時/天氣/下載（下載用到 FatFs，堆疊要夠）*/
+    xTaskCreate(vNetTask,   "NetTask",   1024, NULL, 2, &netTaskHandle);  /* ESP32 UART：對時/天氣/Discord 訊息。高水位量到只用 ~260 words，1024 是留給未來長傳輸的餘裕 */
 #if SD_STRESS_TEST
     /* 兩個同優先級的 task 同時狂寫/讀 SD → 逼出 FatFs 併發，驗證 volume 鎖 */
     xTaskCreate(vSdStressTask, "SDStress1", 1024, (void *)&sdst_id[0], 1, NULL);
@@ -517,10 +517,11 @@ void vSdStressTask(void *pvParameters)
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * vNetTask — 管 ESP32 UART：對時 + 收指令回話
  *
- * 為什麼獨立一個 task：網路操作（尤其之後下載檔案）可能傳很久，
+ * 為什麼獨立一個 task：網路操作可能傳很久（一次 HTTP 來回就好幾百 ms），
  * 放在 UI 迴圈會拖畫面。獨立 task + 低優先級，不跟渲染/觸控搶。
  *
- * 目前工作：定期問 TIME? 校準時鐘（對到前 3s 重試、對到後 60s 校準），
+ * 目前工作：TIME? 校準時鐘（對到前 3s 重試、對到後 60s 校準）、WX? 抓天氣、
+ * MSG? 取 Discord 新訊息、有待送訊息就送 SEND；
  * 順便撈 ring buffer 把 ESP32 回話組成整行交給 esp_parse_line。
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 void vNetTask(void *pvParameters)
@@ -693,89 +694,6 @@ void Msg_Send(const char *text)
     g_send_text[sizeof(g_send_text) - 1] = '\0';
     g_send_result = 1;                       /* 送出中 */
     g_send_req    = 1;
-}
-
-/* 阻塞讀一整行（到 \n）進 buf。逾時回 0，成功回 1。 */
-static int esp_read_line(char *buf, int max, uint32_t timeout_ms)
-{
-    uint32_t start = HAL_GetTick();
-    int len = 0;
-    for (;;) {
-        uint8_t c;
-        if (esp_rx_pop(&c)) {
-            if (c == '\n' || c == '\r') {
-                if (len > 0) { buf[len] = '\0'; return 1; }   /* 一行結束 */
-            } else if (len < max - 1) {
-                buf[len++] = c;
-            }
-        } else {
-            if (HAL_GetTick() - start > timeout_ms) return 0;  /* 沒資料太久 → 放棄 */
-            vTaskDelay(pdMS_TO_TICKS(2));
-        }
-    }
-}
-
-/* 阻塞讀剛好 count 個裸 byte 進 buf。逾時回 0，成功回 1。 */
-static int esp_read_bytes(uint8_t *buf, int count, uint32_t timeout_ms)
-{
-    uint32_t start = HAL_GetTick();
-    int got = 0;
-    while (got < count) {
-        uint8_t c;
-        if (esp_rx_pop(&c)) {
-            buf[got++] = c;
-            start = HAL_GetTick();     /* 有進資料 → 重置逾時 */
-        } else if (HAL_GetTick() - start > timeout_ms) {
-            return 0;
-        } else {
-            vTaskDelay(1);             /* 沒資料 → 讓出 CPU，避免忙等害觸控頓 */
-        }
-    }
-    return 1;
-}
-
-/* 下載 url 到 SD 的 path。回傳寫入 byte 數，失敗回負數。
- * 協定：送 "DL url" → 收 "BEGIN" → 迴圈收 "C <len>"+資料、寫檔、回 "A"，
- *       直到 "C 0"。每塊自帶長度，不需事先知道總大小。 */
-static int net_download(const char *url, const char *path)
-{
-    char cmd[128];
-    int n = snprintf(cmd, sizeof(cmd), "DL %s\r\n", url);
-    HAL_UART_Transmit(&huart3, (uint8_t *)cmd, n, 200);
-
-    /* 等 BEGIN（跳過殘留的 WX/TIME 舊行）；收到 ERR 代表 ESP32 端失敗 */
-    char line[80];
-    uint32_t t0 = HAL_GetTick();
-    for (;;) {
-        if (!esp_read_line(line, sizeof(line), 10000)) return -1;
-        if (strcmp(line, "BEGIN") == 0) break;
-        if (strcmp(line, "ERR")   == 0) return -2;
-        if (HAL_GetTick() - t0 > 12000) return -1;
-    }
-
-    /* FIL(~550B) 和 buf(512B) 放 static，不佔 NetTask 堆疊（否則會溢位）*/
-    static FIL     f;
-    static uint8_t buf[512];
-    if (f_open(&f, path, FA_CREATE_ALWAYS | FA_WRITE) != FR_OK) return -3;
-
-    int done = 0;
-    for (;;) {
-        /* 讀塊標頭 "C <len>" */
-        if (!esp_read_line(line, sizeof(line), 5000)) { f_close(&f); return -4; }
-        int clen;
-        if (sscanf(line, "C %d", &clen) != 1)         { f_close(&f); return -5; }
-        if (clen == 0) break;                          /* C 0 = 傳完 */
-        if (clen > (int)sizeof(buf))                  { f_close(&f); return -6; }
-
-        /* 讀這塊的裸資料，寫檔，回 ack */
-        if (!esp_read_bytes(buf, clen, 3000))         { f_close(&f); return -7; }
-        UINT bw;
-        f_write(&f, buf, clen, &bw);
-        HAL_UART_Transmit(&huart3, (uint8_t *)"A", 1, 200);   /* ack：單一 byte，不留殘餘換行 */
-        done += clen;
-    }
-    f_close(&f);
-    return done;
 }
 
 /* USER CODE END 4 */
