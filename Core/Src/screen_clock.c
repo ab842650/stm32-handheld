@@ -9,22 +9,18 @@
 #include <string.h>
 
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * 時鐘
+ * Clock. Time comes from the FreeRTOS tick plus the NTP offset; no RTC
+ * peripheral is used. Redraws only when the second actually changes.
  *
- * 計時來源：FreeRTOS tick（xTaskGetTickCount）→ 開機至今的秒數。
- * 目前從 00:00:00 起算（之後可換成 STM32 RTC 週邊保留真實時間）。
- *
- * 更新方式：靠 vUITask 的定期 on_render（每 UI_TICK_MS 一次）。
- * 但每次都重畫會閃、也浪費 —— 所以只有「秒數真的變了」才重畫。
+ * No longer registered as an app — the home title bar shows the time instead.
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 
-#define CLOCK_SCALE   4                         /* 8x16 字放大 4 倍 → 32x64 */
+#define CLOCK_SCALE   4                         /* 8x16 glyphs at 4x = 32x64 */
 
-static uint32_t last_shown = 0xFFFFFFFF;        /* 上次顯示的秒數，強制第一次重畫 */
+static uint32_t last_shown = 0xFFFFFFFF;
 
-extern volatile uint32_t g_clock_offset;        /* NTP 對時的 offset（main.c）*/
+extern volatile uint32_t g_clock_offset;        /* NTP offset */
 
-/* 用放大字置中畫出 "HH:MM:SS" */
 static void draw_time(uint32_t secs)
 {
     uint32_t hh = (secs / 3600) % 24;
@@ -35,13 +31,13 @@ static void draw_time(uint32_t secs)
     snprintf(buf, sizeof(buf), "%02lu:%02lu:%02lu",
              (unsigned long)hh, (unsigned long)mm, (unsigned long)ss);
 
-    uint16_t cw = FONT_WIDTH  * CLOCK_SCALE;    /* 每字寬 32 */
-    uint16_t ch = FONT_HEIGHT * CLOCK_SCALE;    /* 每字高 64 */
-    uint16_t tw = (uint16_t)strlen(buf) * cw;   /* 整串寬 */
+    uint16_t cw = FONT_WIDTH  * CLOCK_SCALE;
+    uint16_t ch = FONT_HEIGHT * CLOCK_SCALE;
+    uint16_t tw = (uint16_t)strlen(buf) * cw;
     uint16_t tx = (ILI9341_WIDTH - tw) / 2;
     uint16_t ty = UI_CONTENT_Y + (UI_CONTENT_H - ch) / 2;
 
-    /* 逐字用 DrawBitmapMono 放大（DrawString 沒有放大，改用字形資料直接畫）*/
+    /* DrawString cannot scale, so feed the glyph data to DrawBitmapMono. */
     for (int i = 0; buf[i] != '\0'; i++) {
         const uint8_t *g = font8x16[(uint8_t)buf[i] - FONT_FIRST];
         ILI9341_DrawBitmapMono(tx + i * cw, ty, g, FONT_WIDTH, FONT_HEIGHT,
@@ -52,7 +48,7 @@ static void draw_time(uint32_t secs)
 static void clock_enter(void)
 {
     UI_DrawFrame("Clock", NULL, "Back");
-    last_shown = 0xFFFFFFFF;                    /* 進來強制重畫一次 */
+    last_shown = 0xFFFFFFFF;                    /* force the first redraw */
 }
 
 static void clock_touch(uint16_t x, uint16_t y)
@@ -61,11 +57,10 @@ static void clock_touch(uint16_t x, uint16_t y)
         Screen_Pop();
 }
 
-/* 由 vUITask 定期呼叫；只有秒數變了才重畫 */
 static void clock_render(void)
 {
     uint32_t secs = xTaskGetTickCount() / configTICK_RATE_HZ + g_clock_offset;
-    if (secs == last_shown) return;             /* 同一秒 → 不動 */
+    if (secs == last_shown) return;
     last_shown = secs;
     draw_time(secs);
 }

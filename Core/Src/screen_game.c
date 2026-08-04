@@ -11,22 +11,22 @@
 #include <strings.h>
 
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * Game — 遊戲選單（launcher）
+ * Game — launcher for loadable modules.
  *
- * 掃 SD 卡根目錄所有 .BIN → 列成選單 → 點一個就 Loader_RunModule 啟動它。
- * 遊戲結束後回到選單。加新遊戲 = 丟一個新的 .BIN 進 SD，選單自動出現，
- * 韌體完全不用動 —— 這就是「換卡匣」。
+ * Lists the .BIN files in /GAMES and hands the chosen one to Loader_RunModule.
+ * Adding a game means dropping a new .BIN on the card; the firmware does not
+ * change at all. That is the whole point of the loader.
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 
-#define GAMES_DIR "/GAMES"              /* 遊戲 .bin 放這個資料夾 */
-#define GAME_MAX  6                     /* 選單最多列幾個（塞得下內容區）*/
+#define GAMES_DIR "/GAMES"
+#define GAME_MAX  6                     /* as many as fit the content area */
 #define ROW_H     28
-#define ROW_Y0    (UI_CONTENT_Y + 8)    /* 第一列 y */
+#define ROW_Y0    (UI_CONTENT_Y + 8)
 
-static char bins[GAME_MAX][13];         /* 8.3 檔名 */
+static char bins[GAME_MAX][13];         /* 8.3 names */
 static int  bin_count;
 
-extern QueueHandle_t ui_event_queue;    /* 遊戲期間累積的觸控要清掉 */
+extern QueueHandle_t ui_event_queue;
 
 static int is_bin(const char *name)
 {
@@ -34,7 +34,6 @@ static int is_bin(const char *name)
     return (n >= 4 && strcasecmp(name + n - 4, ".bin") == 0);
 }
 
-/* 掃 SD 根目錄收集 .BIN 檔名 */
 static int scan_bins(void)
 {
     DIR     dir;
@@ -52,7 +51,6 @@ static int scan_bins(void)
     return n;
 }
 
-/* 畫選單：每列一個遊戲名（去掉 .BIN）*/
 static void draw_menu(void)
 {
     UI_DrawFrame("Games", NULL, "Back");
@@ -67,7 +65,7 @@ static void draw_menu(void)
         char disp[13];
         strcpy(disp, bins[i]);
         char *dot = strrchr(disp, '.');
-        if (dot) *dot = 0;                      /* 去掉 .BIN */
+        if (dot) *dot = 0;                      /* strip the extension */
         ILI9341_DrawString(20, ROW_Y0 + i * ROW_H + (ROW_H - 16) / 2,
                            disp, ILI9341_WHITE, ILI9341_BLACK);
     }
@@ -81,8 +79,8 @@ static void launch(int idx)
 
     int score = Loader_RunModule(path);
     (void)score;
-    xQueueReset(ui_event_queue);            /* 清掉遊戲期間累積的觸控 */
-    draw_menu();                            /* 回到選單 */
+    xQueueReset(ui_event_queue);            /* drop touches queued during play */
+    draw_menu();
 }
 
 static void game_enter(void)
