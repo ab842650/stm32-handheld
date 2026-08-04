@@ -1,10 +1,10 @@
 /* ═══════════════════════════════════════════════════════════════════════
- * 俄羅斯方塊 —— 位置無關遊戲 module (M3)
+ * Tetris — position-independent game module loaded from SD.
  *
- * 版面：左側 10x20 棋盤，右側觸控按鈕（◄ ► 旋轉 落下）+ 分數 + QUIT。
- * 狀態全放 module_main 的 local struct（繞過 M2b），只透過 sys 表碰硬體。
+ * 10x20 board on the left, touch buttons on the right. Like snake.c, all state
+ * lives in a local struct rather than file-scope globals.
  *
- * 編譯：  cd tools/module && bash build.sh tetris.c   → TETRIS.BIN
+ * Build:  cd tools/module && bash build.sh tetris.c   -> TETRIS.BIN
  * ═══════════════════════════════════════════════════════════════════════ */
 
 #include "module_api.h"
@@ -13,11 +13,11 @@
 #define ROWS      20
 #define CELL      11
 #define BOARD_X   4
-#define BOARD_Y   8          /* 棋盤左上角；棋盤佔 x 4..114, y 8..228 */
+#define BOARD_Y   8          /* board occupies x 4..114, y 8..228 */
 
 #define POLL_MS   30
 
-/* 7 種方塊 × 4 旋轉，用 16-bit 遮罩表示 4x4 格（bit 0x8000 = 左上，一列一 nibble）*/
+/* 7 pieces x 4 rotations as 4x4 bit masks; 0x8000 is top-left, one nibble per row. */
 static const uint16_t PIECES[7][4] = {
     {0x0F00, 0x2222, 0x00F0, 0x4444}, /* I */
     {0x0660, 0x0660, 0x0660, 0x0660}, /* O */
@@ -27,20 +27,20 @@ static const uint16_t PIECES[7][4] = {
     {0x44C0, 0x8E00, 0xC880, 0xE200}, /* J */
     {0x4460, 0x0E80, 0xC440, 0x2E00}, /* L */
 };
-/* 顏色：index = board 值（0=空，1..7=方塊型別+1）*/
+/* indexed by board value: 0 empty, 1..7 piece type + 1 */
 static const uint16_t COLORS[8] = {
     MOD_BLACK, MOD_CYAN, MOD_YELLOW, MOD_MAGENTA,
     MOD_GREEN, MOD_RED, MOD_BLUE, MOD_WHITE
 };
 
 typedef struct {
-    uint8_t  board[ROWS][COLS];   /* 0=空，1..7=顏色 */
-    int      type, rot, px, py;   /* 目前方塊 */
+    uint8_t  board[ROWS][COLS];   /* 0 = empty */
+    int      type, rot, px, py;   /* active piece */
     int      nexttype;
     int      score, lines;
     int      alive, running;
     uint32_t rng;
-    int      touching;            /* 觸控 edge 偵測（一次點一個動作）*/
+    int      touching;            /* edge detect: one action per tap */
 } Tetris;
 
 static uint32_t rng_next(Tetris *g)
@@ -61,7 +61,6 @@ static int occ(int type, int rot, int r, int c)
     return (PIECES[type][rot] & (0x8000 >> (r * 4 + c))) != 0;
 }
 
-/* 畫棋盤上一格（內縮 1px 留格線）*/
 static void draw_cell(const syscall_t *sys, int col, int row, uint16_t color)
 {
     int px = BOARD_X + col * CELL, py = BOARD_Y + row * CELL;
@@ -70,7 +69,7 @@ static void draw_cell(const syscall_t *sys, int col, int row, uint16_t color)
         sys->fill_rect(px + 1, py + 1, CELL - 2, CELL - 2, color);
 }
 
-/* 畫/擦目前方塊（color=MOD_BLACK 即擦除）*/
+/* MOD_BLACK erases. */
 static void draw_piece(const syscall_t *sys, int type, int rot, int px, int py, uint16_t color)
 {
     for (int r = 0; r < 4; r++)
@@ -79,7 +78,7 @@ static void draw_piece(const syscall_t *sys, int type, int rot, int px, int py, 
                 draw_cell(sys, px + c, py + r, color);
 }
 
-/* 方塊放在 (px,py,rot) 是否合法（不出界、不重疊）*/
+/* Legal placement: in bounds and not overlapping. */
 static int valid(Tetris *g, int type, int rot, int px, int py)
 {
     for (int r = 0; r < 4; r++)
@@ -107,10 +106,8 @@ static void redraw_board(const syscall_t *sys, Tetris *g)
             draw_cell(sys, c, r, COLORS[g->board[r][c]]);
 }
 
-/* 右側控制按鈕（一次畫好）*/
 static void draw_buttons(const syscall_t *sys)
 {
-    /* QUIT 右上角 */
     sys->fill_rect(284, 0, 36, 20, MOD_RED);
     sys->draw_str(286, 2, "QUIT", MOD_WHITE, MOD_RED);
     /* ◄  ► */
@@ -134,7 +131,7 @@ static void spawn(Tetris *g)
     if (!valid(g, g->type, g->rot, g->px, g->py)) g->alive = 0;
 }
 
-/* 嘗試位移/旋轉：合法就擦舊、畫新 */
+/* Move or rotate if the result is legal. */
 static int try_move(Tetris *g, const syscall_t *sys, int dx, int dy, int drot)
 {
     int nrot = (g->rot + drot) & 3;
@@ -146,7 +143,6 @@ static int try_move(Tetris *g, const syscall_t *sys, int dx, int dy, int drot)
     return 1;
 }
 
-/* 鎖定 + 消行 + 生下一個 */
 static void lock_next(Tetris *g, const syscall_t *sys)
 {
     for (int r = 0; r < 4; r++)
@@ -162,7 +158,7 @@ static void lock_next(Tetris *g, const syscall_t *sys)
             for (int rr = r; rr > 0; rr--)
                 for (int c = 0; c < COLS; c++) g->board[rr][c] = g->board[rr - 1][c];
             for (int c = 0; c < COLS; c++) g->board[0][c] = 0;
-            cleared++; r++;                     /* 同一列再檢查一次 */
+            cleared++; r++;                     /* re-check the same row */
         }
     }
     if (cleared) {
@@ -183,12 +179,11 @@ static void hard_drop(Tetris *g, const syscall_t *sys)
     lock_next(g, sys);
 }
 
-/* 輪詢按鈕（edge：一次點觸發一個動作）*/
 static void poll_input(Tetris *g, const syscall_t *sys)
 {
     uint16_t x, y;
     if (!sys->is_touched(&x, &y)) { g->touching = 0; return; }
-    if (g->touching) return;                    /* 還按著 → 不重複 */
+    if (g->touching) return;                    /* still held */
     g->touching = 1;
     g->rng ^= ((uint32_t)x << 16) ^ y;
 
@@ -210,7 +205,6 @@ int module_main(const syscall_t *sys)
     g.rng = 0x2468ace1u; g.touching = 0;
 
     sys->fill_rect(0, 0, MOD_SCREEN_W, MOD_SCREEN_H, MOD_BLACK);
-    /* 棋盤外框 */
     sys->fill_rect(BOARD_X - 2, BOARD_Y - 2, COLS * CELL + 4, 2, MOD_WHITE);
     sys->fill_rect(BOARD_X - 2, BOARD_Y + ROWS * CELL, COLS * CELL + 4, 2, MOD_WHITE);
     sys->fill_rect(BOARD_X - 2, BOARD_Y - 2, 2, ROWS * CELL + 4, MOD_WHITE);
@@ -230,10 +224,10 @@ int module_main(const syscall_t *sys)
         sys->delay_ms(POLL_MS);
         acc += POLL_MS;
 
-        int tick = 600 - g.lines * 20;          /* 消越多越快 */
+        int tick = 600 - g.lines * 20;          /* speeds up with lines cleared */
         if (tick < 120) tick = 120;
         if (acc >= tick) {
-            if (!try_move(&g, sys, 0, 1, 0))    /* 落不下去 → 鎖定 */
+            if (!try_move(&g, sys, 0, 1, 0))    /* cannot fall: lock it */
                 lock_next(&g, sys);
             acc = 0;
         }

@@ -1,13 +1,11 @@
 /* ═══════════════════════════════════════════════════════════════════════
- * CHIP-8 模擬器 —— 位置無關 module (M3+)
+ * CHIP-8 interpreter — one module that runs many ROMs from /ROMS.
  *
- * 一個 module 跑一堆遊戲：ROM 放在 SD 的 /ROMS，進來先選 ROM，載入後執行。
- * 這是「執行別的架構的碼」——跟 loader 執行原生碼是同一種思想的延伸。
+ * Where the loader executes native code, this executes code for a different
+ * architecture entirely. Uses sys->list_dir and sys->read_file to find and
+ * load ROMs. 64x32 display at 4x, with a 4x4 touch keypad for the 16 keys.
  *
- * 用到新加的 syscall：sys->list_dir（列 ROM）、sys->read_file（載 ROM）。
- * 顯示 64x32 放大 4 倍；下方 4x4 觸控鍵盤對應 CHIP-8 的 16 鍵。
- *
- * 編譯：  cd tools/module && bash build.sh chip8.c   → CHIP8.BIN
+ * Build:  cd tools/module && bash build.sh chip8.c   -> CHIP8.BIN
  * ═══════════════════════════════════════════════════════════════════════ */
 
 #include "module_api.h"
@@ -16,7 +14,6 @@
 #define DISP_X  32
 #define DISP_Y  20
 
-/* 觸控鍵盤幾何 */
 #define KX      6
 #define KY      152
 #define KW      76
@@ -24,7 +21,7 @@
 #define KCOL    78
 #define KROW    22
 
-/* 鍵盤格 → CHIP-8 鍵值（經典排法）*/
+/* keypad cell -> CHIP-8 key, in the traditional layout */
 static const uint8_t KEYMAP[4][4] = {
     {0x1, 0x2, 0x3, 0xC},
     {0x4, 0x5, 0x6, 0xD},
@@ -32,7 +29,7 @@ static const uint8_t KEYMAP[4][4] = {
     {0xA, 0x0, 0xB, 0xF},
 };
 
-/* 內建字型（16 個 hex 數字，每個 5 bytes）*/
+/* built-in font: 16 hex digits, 5 bytes each */
 static const uint8_t FONT[80] = {
     0xF0,0x90,0x90,0x90,0xF0, 0x20,0x60,0x20,0x20,0x70,
     0xF0,0x10,0xF0,0x80,0xF0, 0xF0,0x10,0xF0,0x10,0xF0,
@@ -82,7 +79,7 @@ static void wait_tap(const syscall_t *sys)
     while ( sys->is_touched(&x, &y)) sys->delay_ms(30);
 }
 
-/* ── 顯示 ── */
+/* ── Display ── */
 static void draw_px(const syscall_t *sys, int px, int py, int on)
 {
     sys->fill_rect(DISP_X + px * SCALE, DISP_Y + py * SCALE, SCALE, SCALE,
@@ -114,7 +111,7 @@ static void draw_ui(const syscall_t *sys, const char *rom)
     draw_keypad(sys);
 }
 
-/* ── 輸入：讀觸控 → 設鍵盤狀態（單點，一次一鍵）── */
+/* ── Input: one key at a time ── */
 static void poll_keys(const syscall_t *sys, C8 *c)
 {
     for (int k = 0; k < 16; k++) c->keys[k] = 0;
@@ -129,7 +126,7 @@ static void poll_keys(const syscall_t *sys, C8 *c)
     }
 }
 
-/* ── 執行一個 opcode；回 1 表示 FX0A 在等按鍵（這幀停住）── */
+/* Runs one opcode. Returns 1 if FX0A is blocking on a keypress. */
 static int step(const syscall_t *sys, C8 *c)
 {
     uint16_t op = (uint16_t)(c->mem[c->pc] << 8 | c->mem[c->pc + 1]);
@@ -175,7 +172,7 @@ static int step(const syscall_t *sys, C8 *c)
             for (int col = 0; col < 8; col++) {
                 if (!(sp & (0x80 >> col))) continue;
                 int px = vx + col, py = vy + row;
-                if (px >= 64 || py >= 32) continue;        /* 裁切 */
+                if (px >= 64 || py >= 32) continue;        /* clip */
                 if (c->gfx[py][px]) c->V[0xF] = 1;
                 c->gfx[py][px] ^= 1;
                 draw_px(sys, px, py, c->gfx[py][px]);
@@ -193,13 +190,13 @@ static int step(const syscall_t *sys, C8 *c)
         case 0x0A: {
             int found = -1;
             for (int k = 0; k < 16; k++) if (c->keys[k]) { found = k; break; }
-            if (found < 0) { c->pc -= 2; return 1; }        /* 等按鍵 */
+            if (found < 0) { c->pc -= 2; return 1; }        /* wait for a key */
             c->V[X] = (uint8_t)found;
         } break;
         case 0x15: c->dt = c->V[X]; break;
         case 0x18: c->st = c->V[X]; break;
         case 0x1E: c->I = (uint16_t)(c->I + c->V[X]); break;
-        case 0x29: c->I = (uint16_t)(c->V[X] * 5); break;   /* 字型 */
+        case 0x29: c->I = (uint16_t)(c->V[X] * 5); break;   /* font */
         case 0x33:
             c->mem[c->I]     = c->V[X] / 100;
             c->mem[c->I + 1] = (c->V[X] / 10) % 10;
@@ -224,7 +221,7 @@ static void c8_init(C8 *c)
     c->rng = 0xC0FFEEu; c->running = 1;
 }
 
-/* ── ROM 選單：列 /ROMS，點一個回索引；QUIT/沒選回 -1 ── */
+/* Lists /ROMS and returns the chosen index, or -1 on quit. */
 static int rom_menu(const syscall_t *sys, char roms[][13], int nrom)
 {
     sys->fill_rect(0, 0, MOD_SCREEN_W, MOD_SCREEN_H, MOD_BLACK);
@@ -243,7 +240,7 @@ static int rom_menu(const syscall_t *sys, char roms[][13], int nrom)
             if (y >= y0) {
                 int idx = (y - y0) / rh;
                 if (idx >= 0 && idx < nrom) {
-                    while (sys->is_touched(&x, &y)) sys->delay_ms(20);   /* 等放開 */
+                    while (sys->is_touched(&x, &y)) sys->delay_ms(20);
                     return idx;
                 }
             }
@@ -282,13 +279,13 @@ int module_main(const syscall_t *sys)
 
     draw_ui(sys, roms[sel]);
 
-    /* 主迴圈：一幀跑一批 opcode + 60Hz 遞減 timer + 讀鍵 */
+    /* Per frame: a batch of opcodes, the 60 Hz timers, then input. */
     while (c.running) {
         poll_keys(sys, &c);
         if (!c.running) break;
 
         for (int i = 0; i < 12; i++)
-            if (step(sys, &c)) break;      /* FX0A 等鍵 → 這幀停住 */
+            if (step(sys, &c)) break;      /* blocked on a keypress */
 
         if (c.dt > 0) c.dt--;
         if (c.st > 0) c.st--;

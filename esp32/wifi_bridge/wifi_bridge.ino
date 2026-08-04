@@ -1,57 +1,47 @@
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * wifi_bridge —— ESP32-S3 當 STM32 掌機的 WiFi 協處理器
+/* wifi_bridge - ESP32-S3 acting as the handheld's WiFi co-processor.
  *
- * STM32F407 沒有網路硬體，而且把 TCP/IP + TLS + JSON 塞進去也不划算。
- * 所以網路那一半整個交給 ESP32：它跑 WiFi/HTTPS/JSON，對 STM32 只暴露
- * 一組「一行一則」的文字指令。STM32 那邊就只是一個 UART 驅動而已。
+ * The STM32F407 has no networking hardware, so the whole network half lives
+ * here: WiFi, HTTPS, NTP and JSON, exposed to the STM32 as one-line text
+ * commands. That reduces "the internet" to a UART driver on the other side.
  *
- *   STM32  ──UART 115200 8N1──  ESP32-S3  ──WiFi──  Internet
- *          「WX?」→                    → HTTP GET wttr.in
- *          ← 「WX Taipei: +33C」       ←
+ *   STM32 PB10 (USART3_TX) --> ESP32 GPIO18 (STM_RX)
+ *   STM32 PB11 (USART3_RX) <-- ESP32 GPIO17 (STM_TX)
+ *   GND                    --- GND       (required; both sides are 3.3 V)
  *
- * 接線（兩邊都是 3.3V，不需要準位轉換，但 GND 一定要共接）：
- *
- *   STM32 PB10 (USART3_TX) ──→ ESP32 GPIO18 (STM_RX)
- *   STM32 PB11 (USART3_RX) ←── ESP32 GPIO17 (STM_TX)
- *   GND                    ─── GND
- *
- * 設定與踩過的坑見同目錄 ../README.md。憑證放 secrets.h（已 gitignore）。
- * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+ * Protocol table and setup notes are in ../README.md.
+ * Credentials live in secrets.h, which is gitignored. */
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
-#include <ArduinoJson.h>          // 程式庫管理員裝 ArduinoJson 7.x
+#include <ArduinoJson.h>          // v7.x; the v6 API will not compile
 #include <time.h>
 
-/* WiFi 帳密與 Discord token。複製 secrets.h.example 成 secrets.h 再填。
- * secrets.h 在 .gitignore 裡 —— 真實憑證絕不進版控。 */
-#include "secrets.h"
+#include "secrets.h"              // copy secrets.h.example and fill it in
 
-#define STM_RX 18   // 接 STM32 PB10 (TX)
-#define STM_TX 17   // 接 STM32 PB11 (RX)
+#define STM_RX 18   // to STM32 PB10 (TX)
+#define STM_TX 17   // to STM32 PB11 (RX)
 
-const uint32_t DC_POLL_MS = 3000; // 每 3 秒問一次 Discord 有沒有新訊息
+const uint32_t DC_POLL_MS = 3000;
 
-// NTP：台灣 UTC+8，無日光節約
-const long  GMT_OFFSET = 8 * 3600;
+const long  GMT_OFFSET = 8 * 3600;   // UTC+8, no DST
 const int   DST_OFFSET = 0;
 
-String line;   // 累積 STM32 送來的字元，直到換行
+String line;   // accumulates STM32 bytes until a newline
 
 void downloadFile(String url);
 
-/* ── 訊息佇列：ESP32 自己輪詢 Discord 收進來，STM32 用 MSG? 一則一則拿 ──
- * 這樣兩邊解耦：網路節奏（rate limit）由 ESP32 管，STM32 只做便宜的 UART 詢問。*/
+/* The ESP32 polls Discord on its own schedule into this queue; the STM32 just
+ * asks MSG? for one at a time. Rate limiting stays on the network side. */
 #define MSGQ_N 8
 String   msgq[MSGQ_N];
 int      msgq_head = 0, msgq_tail = 0;
-String   dc_lastId = "";          // 已處理到哪一則（Discord snowflake ID）
+String   dc_lastId = "";          // snowflake of the last handled message
 uint32_t dc_next_poll = 0;
 
 void msgq_push(const String& s) {
   int n = (msgq_head + 1) % MSGQ_N;
-  if (n != msgq_tail) { msgq[msgq_head] = s; msgq_head = n; }   // 滿了就丟掉最新的
+  if (n != msgq_tail) { msgq[msgq_head] = s; msgq_head = n; }   // full: drop it
 }
 bool msgq_pop(String& s) {
   if (msgq_head == msgq_tail) return false;
@@ -60,7 +50,7 @@ bool msgq_pop(String& s) {
   return true;
 }
 
-// STM32 字型只認 ASCII，且協定是「一行一則」→ 濾掉非 ASCII、換行改空格
+// The STM32 font is ASCII-only and the protocol is one message per line.
 String toAscii(const String& s, int maxlen) {
   String out;
   for (size_t i = 0; i < s.length() && (int)out.length() < maxlen; i++) {
@@ -93,13 +83,13 @@ void setup() {
   }
 }
 
-/* ── Discord：輪詢新訊息 ──
- * 第一次只抓最新一則當基準（不把舊訊息全倒出來），之後用 ?after=<id> 只拿新的。*/
+/* The first poll fetches a single message purely to establish a baseline ID,
+ * otherwise the whole channel history dumps out on boot. */
 void discordPoll() {
   if (WiFi.status() != WL_CONNECTED || strlen(DC_TOKEN) == 0) return;
 
   WiFiClientSecure client;
-  client.setInsecure();            // 不驗證憑證（自用專案夠了，省下內建 CA 的麻煩）
+  client.setInsecure();            // no cert validation; fine for personal use
   HTTPClient http;
 
   String url = "https://discord.com/api/v10/channels/" + String(DC_CHANNEL) + "/messages?limit=";
@@ -114,17 +104,17 @@ void discordPoll() {
     JsonDocument doc;
     if (deserializeJson(doc, http.getString()) == DeserializationError::Ok) {
       JsonArray arr = doc.as<JsonArray>();
-      // Discord 回傳「新→舊」，反向走才是時間順序
+      // Discord returns newest first, so walk it backwards for chronological order
       for (int i = arr.size() - 1; i >= 0; i--) {
         JsonObject m = arr[i];
-        dc_lastId = m["id"].as<String>();          // 推進進度（含被略過的）
+        dc_lastId = m["id"].as<String>();          // advance past skipped ones too
 
-        if (first) continue;                        // 第一次只取基準，不顯示
-        if (m["author"]["bot"] | false) continue;   // 略過 bot 自己（避免自問自答）
+        if (first) continue;                        // baseline only
+        if (m["author"]["bot"] | false) continue;   // or it reads back its own posts
 
         String user = toAscii(m["author"]["username"].as<String>(), 12);
         String text = toAscii(m["content"].as<String>(), 80);
-        if (text.length() == 0) continue;           // 純圖片/貼圖，沒有文字內容
+        if (text.length() == 0) continue;           // image or sticker, no text
 
         msgq_push(user + ": " + text);
         Serial.printf("DC recv> %s: %s\n", user.c_str(), text.c_str());
@@ -136,7 +126,6 @@ void discordPoll() {
   http.end();
 }
 
-// Discord：送一則訊息到頻道
 bool discordSend(const String& text) {
   if (WiFi.status() != WL_CONNECTED || strlen(DC_TOKEN) == 0) return false;
 
@@ -161,7 +150,7 @@ bool discordSend(const String& text) {
 
 void handleCommand(String cmd) {
   cmd.trim();
-  if (cmd.length() == 0) return;   // 空指令（殘留換行等）忽略
+  if (cmd.length() == 0) return;   // stray newline
   Serial.printf("STM32 said: [%s]\n", cmd.c_str());
 
   if (cmd == "PING") {
@@ -173,15 +162,16 @@ void handleCommand(String cmd) {
       Serial1.print("WIFI DOWN\n");
   } else if (cmd == "TIME?") {
     struct tm t;
-    if (getLocalTime(&t, 100)) {   // 最多等 100ms 拿本地時間
+    if (getLocalTime(&t, 100)) {
       Serial1.printf("TIME %02d:%02d:%02d\n", t.tm_hour, t.tm_min, t.tm_sec);
     } else {
-      Serial1.print("TIME NONE\n");   // 還沒對到時
+      Serial1.print("TIME NONE\n");   // NTP has not synced yet
     }
   } else if (cmd == "WX?") {
     if (WiFi.status() != WL_CONNECTED) { Serial1.print("WX DOWN\n"); return; }
     HTTPClient http;
-    // wttr.in 天氣：format 用 "地點: +溫度"，避開 emoji（螢幕字型顯示不了）
+    // Ask for "place: +temp" only — the default wttr.in output is full of
+    // emoji the screen font cannot draw.
     http.begin("http://wttr.in/Taipei?format=%l:+%t");
     http.setTimeout(5000);
     int code = http.GET();
@@ -194,7 +184,6 @@ void handleCommand(String cmd) {
     }
     http.end();
   } else if (cmd == "MSG?") {
-    // 有新訊息就給一則，沒有就 MSGNONE
     String m;
     if (msgq_pop(m)) Serial1.printf("MSG %s\n", m.c_str());
     else             Serial1.print("MSGNONE\n");
@@ -207,7 +196,7 @@ void handleCommand(String cmd) {
   }
 }
 
-// 等 STM32 回一個 'A'（chunk ack），逾時回 false
+// Waits for the STM32's single-byte 'A' chunk ack.
 bool waitAck(uint32_t timeout_ms) {
   uint32_t start = millis();
   while (millis() - start < timeout_ms) {
@@ -216,65 +205,63 @@ bool waitAck(uint32_t timeout_ms) {
   return false;
 }
 
-/* 下載 url，分塊 + 逐塊等 STM32 ack，把裸 byte 送給 STM32。
+/* Chunked download, paced by the STM32.
  *
- * ⚠️ STM32 端的對應實作（net_download）已移除 —— 協定驗證過可用，但一直
- *    沒接到任何 UI 動作。這半邊保留著，要復原 STM32 那半就：
- *        git show c04cb1b -- Core/Src/main.c
+ * The STM32 half (net_download) was removed - the protocol worked but was
+ * never wired to a UI action. Restore it with:
+ *     git show c04cb1b -- Core/Src/main.c
  *
- * 協定：STM32 送 "DL <url>" → ESP32 回 "BEGIN" → 迴圈送「"C <len>" + 裸資料」
- *       並等 STM32 回 "A" → 最後送 "C 0" 表示結束。
- *       每塊自帶長度，所以不需要事先知道總大小（HTTP/1.0 close-delimited
- *       回應沒有 Content-Length，這是當初改成這樣的原因）。 */
+ * "DL <url>" -> "BEGIN", then repeated "C <len>" plus raw bytes, each waiting
+ * for the STM32 to ack with "A", ending with "C 0". Each chunk carries its own
+ * length so the total never has to be known in advance - HTTP/1.0
+ * close-delimited responses have no Content-Length. The ack is flow control:
+ * it stops the ESP32 outrunning the STM32's RX ring while it writes to SD. */
 void downloadFile(String url) {
   url.trim();
   if (WiFi.status() != WL_CONNECTED) { Serial1.print("SIZE -1\n"); return; }
 
   HTTPClient http;
   http.begin(url);
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);   // 自動跟隨轉址
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   int code = http.GET();
   Serial.printf("DL: url=%s code=%d\n", url.c_str(), code);
 
   if (code != 200) { Serial1.print("ERR\n"); http.end(); return; }
 
-  // 先把完整內容抓進記憶體（getString 會處理 chunked 解碼），再分塊送
-  String body = http.getString();
+  String body = http.getString();   // also handles chunked transfer decoding
   http.end();
   int total = body.length();
   const uint8_t* p = (const uint8_t*)body.c_str();
   Serial.printf("DL: got %d bytes, sending...\n", total);
 
-  Serial1.print("BEGIN\n");             // 通知 STM32 開始
+  Serial1.print("BEGIN\n");
   int sent = 0;
   while (sent < total) {
     int n = min(512, total - sent);
-    Serial1.printf("C %d\n", n);        // 這塊的長度標頭
-    Serial1.write(p + sent, n);         // 這塊的裸資料
-    if (!waitAck(3000)) return;         // 等 STM32 ack 才送下一塊
+    Serial1.printf("C %d\n", n);        // length header
+    Serial1.write(p + sent, n);         // raw payload
+    if (!waitAck(3000)) return;
     sent += n;
   }
-  Serial1.print("C 0\n");               // 0 長度 = 傳完
+  Serial1.print("C 0\n");               // zero length ends it
   Serial.printf("download done: %d bytes\n", total);
 }
 
 void loop() {
-  // STM32 的指令優先處理
   while (Serial1.available()) {
     char c = Serial1.read();
     if (c == '\n') { handleCommand(line); line = ""; }
     else           { line += c; }
   }
 
-  // 自己定期去 Discord 收信
   if (millis() >= dc_next_poll) {
     dc_next_poll = millis() + DC_POLL_MS;
     discordPoll();
   }
 
-  /* 除錯用：在 ESP32 的序列埠監看視窗直接打字 → 送到 Discord。
-   * 不需要接 STM32 就能單獨驗證 Discord 那一半通不通，當初 bring-up
-   * 就是靠這個把「ESP32↔Discord」和「STM32↔ESP32」兩段分開來測。 */
+  /* Debug aid: typing in the ESP32 serial monitor posts straight to Discord,
+   * which verifies the ESP32<->Discord half without the STM32 attached.
+   * Splitting bring-up that way was worth doing. */
   if (Serial.available()) {
     String s = Serial.readStringUntil('\n');
     s.trim();
