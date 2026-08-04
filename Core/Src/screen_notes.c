@@ -4,21 +4,18 @@
 #include "ili9341.h"
 #include "ui.h"
 #include "font.h"
-#include "fatfs.h"     /* f_opendir / f_readdir / f_open / f_read */
+#include "fatfs.h"
 #include <string.h>
 #include <strings.h>   /* strcasecmp */
 
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * Notes — 列出 /NOTES 資料夾裡的 .txt，點一個看內容（類記事本）
+/* Notes — browse and append to .txt files in /NOTES.
  *
- * 兩種模式：LIST（檔案清單）/ VIEW（看內文）。
- *   LIST：點檔名 → 進 VIEW；點 Back → 回主選單
- *   VIEW：左軟鍵 Add → 螢幕鍵盤，打完 Send 就把該行 append 進檔案
- *         點 Back → 回 LIST
+ * LIST mode shows the files; VIEW mode shows one file's contents and offers an
+ * Add softkey that opens the keyboard and appends the typed line.
  *
- * 寫入是在 UITask 裡直接呼叫 f_open/f_write —— 現在安全，因為 FatFs 已經
- * 開了 volume 重入鎖（ffconf.h `_FS_REENTRANT`），跟 NetTask 撞到會自動排隊。
- * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+ * Writing calls f_open/f_write straight from UITask. That is only safe because
+ * _FS_REENTRANT is on: NetTask touches the card too, and before the volume
+ * lock existed this pattern corrupted the filesystem. */
 
 #define NOTES_DIR    "/NOTES"
 #define NOTES_MAX    6
@@ -26,11 +23,11 @@
 #define ROW_Y0       (UI_CONTENT_Y + 8)
 #define NOTES_BUFSZ  1024
 
-static char notes_list[NOTES_MAX][13];   /* 8.3 檔名 */
+static char notes_list[NOTES_MAX][13];   /* 8.3 names */
 static int  notes_count;
-static int  notes_mode;                  /* 0=LIST，1=VIEW */
-static int  notes_cur = -1;              /* VIEW 中的檔案索引（給 Add 用）*/
-static char notebuf[NOTES_BUFSZ];        /* 內文（.bss，不佔 stack）*/
+static int  notes_mode;                  /* 0 = LIST, 1 = VIEW */
+static int  notes_cur = -1;              /* file shown in VIEW */
+static char notebuf[NOTES_BUFSZ];        /* .bss, too big for a stack */
 
 static void view_file(int idx);
 
@@ -57,7 +54,6 @@ static int scan_txt(void)
     return n;
 }
 
-/* 檔案清單 */
 static void draw_list(void)
 {
     notes_mode = 0;
@@ -78,7 +74,6 @@ static void draw_list(void)
     }
 }
 
-/* 看某個檔的內文 */
 static void view_file(int idx)
 {
     char path[32];
@@ -109,7 +104,7 @@ static void view_file(int idx)
                        ILI9341_WHITE, ILI9341_BLACK);
 }
 
-/* 鍵盤按 Send 的回呼：把這一行接到目前檔案尾端，再重新載入顯示 */
+/* Keyboard callback: append the line, then reload so it shows immediately. */
 static void note_append(const char *text)
 {
     if (notes_cur < 0 || text == NULL || text[0] == '\0') return;
@@ -127,16 +122,16 @@ static void note_append(const char *text)
     }
     f_write(&fil, text, (UINT)strlen(text), &bw);
     f_write(&fil, "\n", 1, &bw);
-    f_close(&fil);                              /* close 才會把 FAT 寫回卡上 */
+    f_close(&fil);                              /* flushes the FAT to the card */
 
-    view_file(notes_cur);                       /* 重讀，讓新的一行馬上看到 */
+    view_file(notes_cur);
 }
 
 static void notes_enter(void)
 {
     notes_count = scan_txt();
-    /* 從鍵盤 pop 回來時 Screen 會再呼叫一次 on_enter；
-     * 若剛才在 VIEW，就回到 VIEW 而不是彈回清單。 */
+    /* on_enter also fires when the keyboard pops, so return to VIEW rather
+     * than dropping back to the list. */
     if (notes_mode == 1 && notes_cur >= 0 && notes_cur < notes_count)
         view_file(notes_cur);
     else
@@ -145,9 +140,9 @@ static void notes_enter(void)
 
 static void notes_touch(uint16_t x, uint16_t y)
 {
-    if (notes_mode == 1) {                      /* VIEW */
+    if (notes_mode == 1) {
         if (UI_BackTouched(x, y)) { notes_cur = -1; draw_list(); return; }
-        /* 左軟鍵 Add */
+        /* Add softkey */
         if (y >= UI_SOFT_Y && x < ILI9341_WIDTH / 2) {
             char t[13];
             strcpy(t, notes_list[notes_cur]);
@@ -157,7 +152,6 @@ static void notes_touch(uint16_t x, uint16_t y)
         }
         return;
     }
-    /* LIST */
     if (UI_BackTouched(x, y)) { Screen_Pop(); return; }
     if (y >= ROW_Y0 && y < UI_SOFT_Y) {
         int idx = (y - ROW_Y0) / ROW_H;

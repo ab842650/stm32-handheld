@@ -2,7 +2,7 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : ILI9341 顯示驅動驗測
+  * @brief          : Application entry point and RTOS tasks
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -35,49 +35,51 @@
 
 /* Private variables ---------------------------------------------------------*/
 UART_HandleTypeDef huart2;
-UART_HandleTypeDef huart3;          /* ESP32-S3 WiFi 連線（PB10/PB11）*/
+UART_HandleTypeDef huart3;          /* ESP32-S3 link, PB10/PB11 */
 SPI_HandleTypeDef  hspi1;
-SPI_HandleTypeDef  hspi2;           /* SD 卡（獨立 SPI2）*/
+SPI_HandleTypeDef  hspi2;           /* SD card, on its own bus */
 DMA_HandleTypeDef  hdma_spi1_tx;
 
 /* USER CODE BEGIN PV */
-/* IPC（放在 USER CODE 區內，CubeMX 重新產生時不會被蓋掉）*/
-SemaphoreHandle_t  spi_bus_mutex;   /* 保護 SPI1 匯流排 */
+/* Inside a USER CODE block so a CubeMX regen would not wipe it. */
+SemaphoreHandle_t  spi_bus_mutex;   /* display and touch share SPI1 */
 QueueHandle_t      ui_event_queue;  /* InputTask → UITask */
 TaskHandle_t       inputTaskHandle;
 TaskHandle_t       uiTaskHandle;
 TaskHandle_t       netTaskHandle;
 
-/* ── ESP32 UART 接收：中斷 ISR 寫入、task 讀出的環形緩衝區 ── */
+/* Single-producer/single-consumer ring: the ISR owns head, the task owns
+ * tail, so neither needs a lock. Both must stay volatile. */
 #define ESP_RX_SZ 1024
 static volatile uint8_t  esp_rx_buf[ESP_RX_SZ];
-static volatile uint16_t esp_rx_head;   /* ISR 寫到哪 */
-static volatile uint16_t esp_rx_tail;   /* task 讀到哪 */
-static uint8_t           esp_rx_byte;   /* HAL 每次收 1 byte 暫存這 */
+static volatile uint16_t esp_rx_head;   /* written by the ISR */
+static volatile uint16_t esp_rx_tail;   /* written by the task */
+static uint8_t           esp_rx_byte;   /* HAL lands one byte here */
 
-/* 從 NTP 對時得到的「一天中的秒數」offset，時鐘顯示時加上去（screen_clock.c 讀）*/
+/* Seconds-of-day offset from NTP; screens add it to the tick count. */
 volatile uint32_t g_clock_offset = 0;
-volatile uint8_t  g_time_valid   = 0;   /* 已成功對到時 = 1 */
-char              g_weather[48]  = "";  /* 最近一次抓到的天氣字串 */
+volatile uint8_t  g_time_valid   = 0;
+char              g_weather[48]  = "";
 
-/* ── Discord 訊息：ring buffer 保留最近 MSG_MAX 則（screen_msg.c 讀）── */
+/* Last MSG_MAX Discord messages, read by screen_msg.c. */
 #define MSG_MAX 8
-#define MSG_LEN 40      /* 螢幕一行剛好 320/8 = 40 字元 */
+#define MSG_LEN 40      /* one screen line is exactly 320/8 chars */
 char              g_msgs[MSG_MAX][MSG_LEN];
-volatile uint32_t g_msg_n;        /* 已收到的總則數（只增；第 k 則存 g_msgs[k % MSG_MAX]）*/
-volatile uint8_t  g_msg_unread;   /* 未讀數，進 Messages 畫面時歸零 */
-volatile uint8_t  g_send_result;  /* 0=閒置 1=送出中 2=成功 3=失敗 */
-static char       g_send_text[64];/* 待送出的訊息（NetTask 取走）*/
+volatile uint32_t g_msg_n;        /* total ever received; message k is at k % MSG_MAX */
+volatile uint8_t  g_msg_unread;
+volatile uint8_t  g_send_result;  /* 0 idle, 1 sending, 2 sent, 3 failed */
+static char       g_send_text[64];/* picked up by NetTask */
 static volatile uint8_t g_send_req;
 
-/* ── SD 併發壓力測試（驗證 FatFs volume 鎖有效）。已驗證通過，平時設 0；
- *    改回 1 可重跑：兩個 task 狂寫/讀 SD 並逐 byte 驗證，報告在 vNetTask ── */
+/* SD concurrency stress test: two tasks hammer the card and byte-compare
+ * what they read back, proving the FatFs volume lock works. Passed; left at 0.
+ * Set to 1 to re-run — results are printed from vNetTask. */
 #define SD_STRESS_TEST 0
 #if SD_STRESS_TEST
-extern volatile unsigned long ff_lock_n, ff_contend_n;   /* syscall.c 的鎖計數器 */
+extern volatile unsigned long ff_lock_n, ff_contend_n;   /* counters in syscall.c */
 #define SDST_BUF 128
 static const int sdst_id[2] = { 0, 1 };
-static FIL       sdst_fil[2];                    /* FIL 很大，放 static 不佔堆疊 */
+static FIL       sdst_fil[2];                    /* FIL is large; keep it off the stack */
 static uint8_t   sdst_wbuf[2][SDST_BUF];
 static uint8_t   sdst_rbuf[2][SDST_BUF];
 static volatile uint32_t sdst_iter[2], sdst_fail[2], sdst_lastbad[2];
@@ -100,9 +102,10 @@ void vInputTask(void *pvParameters);
 void vNetTask(void *pvParameters);
 static int esp_rx_pop(uint8_t *out);
 static void esp_parse_line(const char *s);
-/* net_download()（W5 無線下載到 SD）連同 esp_read_line/esp_read_bytes 已移除。
- * 協定驗證過可用但一直沒接到 UI，留著只是未使用警告。
- * ESP32 端的 "DL <url>" 仍在，要復原就 git show c04cb1b -- Core/Src/main.c */
+/* net_download() and its esp_read_line/esp_read_bytes helpers were removed:
+ * the protocol worked but was never wired to a UI action. The ESP32 still
+ * handles "DL <url>"; restore this half with
+ *   git show c04cb1b -- Core/Src/main.c */
 #if SD_STRESS_TEST
 void vSdStressTask(void *pvParameters);
 #endif
@@ -116,16 +119,16 @@ int main(void)
     HAL_Init();
     SystemClock_Config();
 
-    MX_DMA_Init();      /* DMA 必須在 SPI 之前初始化 */
+    MX_DMA_Init();      /* must precede SPI init */
     MX_GPIO_Init();
     MX_USART2_UART_Init();
     MX_USART3_UART_Init();      /* ESP32-S3 UART */
     MX_SPI1_Init();
-    MX_SPI2_Init();     /* SD 卡 SPI */
-    MX_FATFS_Init();    /* 連結 FatFs 磁碟驅動（USER_Driver → user_diskio_spi）*/
+    MX_SPI2_Init();     /* SD card */
+    MX_FATFS_Init();    /* links USER_Driver -> user_diskio_spi */
 
     /* USER CODE BEGIN 2 */
-    /* DWT Cycle Counter 初始化（168 MHz，量測精度 ~6 ns）*/
+    /* DWT cycle counter: ~6 ns resolution at 168 MHz */
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
     DWT->CYCCNT = 0;
     DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
@@ -141,11 +144,12 @@ int main(void)
     XPT2046_Init(&hspi1);
     myprintf("XPT2046 init done\r\n");
 
-    xTaskCreate(vUITask,    "UITask",    2560, NULL, 3, &uiTaskHandle);   /* 2560 words(10KB)：module 狀態放堆疊，CHIP-8 記憶體 4KB+顯示緩衝 */
+    xTaskCreate(vUITask,    "UITask",    2560, NULL, 3, &uiTaskHandle);   /* 10 KB: modules keep state on this stack, CHIP-8 needs 4 KB plus a framebuffer */
     xTaskCreate(vInputTask, "InputTask", 256, NULL, 4, &inputTaskHandle);
-    xTaskCreate(vNetTask,   "NetTask",   1024, NULL, 2, &netTaskHandle);  /* ESP32 UART：對時/天氣/Discord 訊息。高水位量到只用 ~260 words，1024 是留給未來長傳輸的餘裕 */
+    xTaskCreate(vNetTask,   "NetTask",   1024, NULL, 2, &netTaskHandle);  /* time/weather/messages; measured peak ~260 words, rest is headroom */
 #if SD_STRESS_TEST
-    /* 兩個同優先級的 task 同時狂寫/讀 SD → 逼出 FatFs 併發，驗證 volume 鎖 */
+    /* Equal priority so the scheduler preempts them mid-f_*, which is what
+     * actually forces concurrent FatFs entry. */
     xTaskCreate(vSdStressTask, "SDStress1", 1024, (void *)&sdst_id[0], 1, NULL);
     xTaskCreate(vSdStressTask, "SDStress2", 1024, (void *)&sdst_id[1], 1, NULL);
 #endif
@@ -161,7 +165,7 @@ int main(void)
 
     vTaskStartScheduler();
 
-    /* 不應該跑到這裡（scheduler 啟動後不返回）*/
+    /* not reached */
     while (1) {}
     /* USER CODE END 2 */
 }
@@ -197,12 +201,11 @@ void SystemClock_Config(void)
 }
 
 /**
-  * @brief SPI1 — 給 ILI9341 用
+  * @brief SPI1 — ILI9341 display and XPT2046 touch
   *
-  * SPI1 掛在 APB2 上，APB2 = 168/2 = 84 MHz
-  * Prescaler 8 → SPI 速度 = 84/8 = 10.5 MHz（保守值，測試穩定後可改 4 → 21 MHz）
-  *
-  * ILI9341 需要：Mode 0（CPOL=0, CPHA=0），MSB first
+  * APB2 runs at 84 MHz. Prescaler 8 gives 10.5 MHz; the display tolerates
+  * prescaler 2 (42 MHz), which is what the driver switches to at run time.
+  * ILI9341 wants mode 0 (CPOL=0, CPHA=0), MSB first.
   */
 static void MX_SPI1_Init(void)
 {
@@ -212,7 +215,7 @@ static void MX_SPI1_Init(void)
     hspi1.Init.DataSize          = SPI_DATASIZE_8BIT;
     hspi1.Init.CLKPolarity       = SPI_POLARITY_LOW;   /* CPOL = 0 */
     hspi1.Init.CLKPhase          = SPI_PHASE_1EDGE;    /* CPHA = 0 */
-    hspi1.Init.NSS               = SPI_NSS_SOFT;       /* CS 由軟體控制 */
+    hspi1.Init.NSS               = SPI_NSS_SOFT;       /* CS driven by software */
     hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2; /* 84/2 = 42 MHz */
     hspi1.Init.FirstBit          = SPI_FIRSTBIT_MSB;
     hspi1.Init.TIMode            = SPI_TIMODE_DISABLE;
@@ -229,7 +232,7 @@ static void MX_SPI2_Init(void)
     hspi2.Init.DataSize          = SPI_DATASIZE_8BIT;
     hspi2.Init.CLKPolarity       = SPI_POLARITY_LOW;   /* CPOL = 0 */
     hspi2.Init.CLKPhase          = SPI_PHASE_1EDGE;    /* CPHA = 0 */
-    hspi2.Init.NSS               = SPI_NSS_SOFT;       /* CS 由軟體控制 */
+    hspi2.Init.NSS               = SPI_NSS_SOFT;       /* CS driven by software */
     hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
     hspi2.Init.FirstBit          = SPI_FIRSTBIT_MSB;
     hspi2.Init.TIMode            = SPI_TIMODE_DISABLE;
@@ -239,7 +242,7 @@ static void MX_SPI2_Init(void)
 }
 
 /**
-  * @brief USART2 — 115200，PA2(TX)/PA3(RX)，給 myprintf debug 用
+  * @brief USART2 — 115200 on PA2/PA3, debug console for myprintf
   */
 static void MX_USART2_UART_Init(void)
 {
@@ -255,7 +258,7 @@ static void MX_USART2_UART_Init(void)
 }
 
 /**
-  * @brief USART3 — 115200，PB10(TX)/PB11(RX)，接 ESP32-S3 做 WiFi
+  * @brief USART3 — 115200 on PB10/PB11, link to the ESP32-S3
   */
 static void MX_USART3_UART_Init(void)
 {
@@ -269,30 +272,29 @@ static void MX_USART3_UART_Init(void)
     huart3.Init.OverSampling = UART_OVERSAMPLING_16;
     if (HAL_UART_Init(&huart3) != HAL_OK) { Error_Handler(); }
 
-    /* 武裝中斷接收：收到 1 byte 就中斷 → HAL_UART_RxCpltCallback */
+    /* Arm byte-at-a-time RX; each byte lands in HAL_UART_RxCpltCallback. */
     HAL_UART_Receive_IT(&huart3, &esp_rx_byte, 1);
 }
 
 /**
   * @brief GPIO Initialization
   *
-  * SPI1 的 SCK/MISO/MOSI 腳位由 HAL_SPI_MspInit 在 HAL_SPI_Init 時自動設定。
-  * 這裡只需設定 CS / DC / RST（純 GPIO output）。
+  * HAL_SPI_MspInit already configures SCK/MISO/MOSI; only the plain GPIO
+  * lines (CS / DC / RST) are set up here.
   */
 static void MX_GPIO_Init(void)
 {
     GPIO_InitTypeDef GPIO_InitStruct = {0};
 
-    /* 開啟所有用到的 GPIO 時脈 */
+    /* clocks for every port used below */
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
     __HAL_RCC_GPIOC_CLK_ENABLE();
     __HAL_RCC_GPIOD_CLK_ENABLE();
     __HAL_RCC_GPIOH_CLK_ENABLE();
 
-    /* ILI9341 控制腳：CS(PB0)、DC(PB1)、RST(PB2)
-     * 初始狀態：CS=HIGH（未選中）、DC=HIGH、RST=HIGH
-     * ILI9341_Init() 會自己處理 RST 的時序 */
+    /* ILI9341 CS(PB0) / DC(PB1) / RST(PB2), all idle high.
+     * ILI9341_Init() drives the reset sequence itself. */
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2, GPIO_PIN_SET);
     GPIO_InitStruct.Pin   = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2;
     GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
@@ -300,7 +302,7 @@ static void MX_GPIO_Init(void)
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-    /* T_CS (PC4) — 觸控片選，預設拉高（未選中）*/
+    /* T_CS (PC4) — touch chip select, idle high */
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4, GPIO_PIN_SET);
     GPIO_InitStruct.Pin   = GPIO_PIN_4;
     GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
@@ -308,7 +310,7 @@ static void MX_GPIO_Init(void)
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
     HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-    /* SD_CS (PC7) — SD 卡片選，預設拉高（未選中）*/
+    /* SD_CS (PC7) — card chip select, idle high */
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_SET);
     GPIO_InitStruct.Pin   = GPIO_PIN_7;
     GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
@@ -316,7 +318,7 @@ static void MX_GPIO_Init(void)
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
     HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-    /* T_IRQ (PC5) — 觸控中斷，低電位表示觸碰，EXTI falling edge */
+    /* T_IRQ (PC5) — low while touched; EXTI on the falling edge */
     GPIO_InitStruct.Pin  = GPIO_PIN_5;
     GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
     GPIO_InitStruct.Pull = GPIO_PULLUP;
@@ -324,7 +326,7 @@ static void MX_GPIO_Init(void)
     HAL_NVIC_SetPriority(EXTI9_5_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
 
-    /* PD12 (LD4 綠 LED) — 亮燈表示系統已開機 */
+    /* PD12 (LD4) — lit once the system is up */
     HAL_GPIO_WritePin(GPIOD, GPIO_PIN_12, GPIO_PIN_SET);
     GPIO_InitStruct.Pin   = GPIO_PIN_12;
     GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
@@ -336,18 +338,15 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 
 /* ── UI Task ────────────────────────────────────────────────────────────────
- * 負責螢幕渲染。用 vTaskDelay 等待而非 HAL_Delay，
- * 等待期間 CPU 可以去跑其他 task（例如之後的 InputTask、SensorTask）。
- * FillScreen 內部也會透過 DMA semaphore yield，不會 busy-wait。
+ * Owns all rendering. Every wait here blocks rather than spins: vTaskDelay
+ * instead of HAL_Delay, and the DMA semaphore inside the display driver.
  * ──────────────────────────────────────────────────────────────────────────*/
-#define UI_TICK_MS  200   /* 閒置時的重繪間隔（5 Hz）；有觸控會立刻醒來 */
+#define UI_TICK_MS  200   /* idle redraw period; touch wakes the task sooner */
 
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * SD 卡掛載自測（暫時性，驗證 SPI2 + FatFs + 接線）
- *
- * 掛載 → 讀 test.txt（不存在就自己建，順便測寫入）→ 印序列埠。
- * FatFs 回傳碼 fr：0 = FR_OK，其他見 ff.h 的 FRESULT（3=NOT_READY 卡沒反應，
- * 1=DISK_ERR 通訊錯，13=NO_FILESYSTEM 沒 FAT32）。
+ * SD bring-up check: mount, then read test.txt (creating it if absent, which
+ * also exercises writing). Common FRESULTs: 1 DISK_ERR, 3 NOT_READY (card not
+ * responding), 13 NO_FILESYSTEM (not FAT32).
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 static void SD_SelfTest(void)
 {
@@ -357,7 +356,7 @@ static void SD_SelfTest(void)
     char    buf[64];
 
     myprintf("SD: mounting...\r\n");
-    fr = f_mount(&USERFatFS, USERPath, 1);          /* 1 = 立即掛載並存取卡 */
+    fr = f_mount(&USERFatFS, USERPath, 1);          /* 1 = mount now rather than lazily */
     if (fr != FR_OK) {
         myprintf("SD: mount FAILED (fr=%d)\r\n", fr);
         return;
@@ -387,39 +386,33 @@ void vUITask(void *pvParameters)
 {
 	Screen_Push(SCREEN_HOME);
 
-    SD_SelfTest();   /* 暫時：驗證 SD，之後移到 Photo 畫面 */
+    SD_SelfTest();
 
     ui_event_t evt;
     for (;;) {
-        /* 等觸控事件，但最多等 UI_TICK_MS 就醒來 —— 讓需要動態更新的畫面
-         * （時鐘、之後的遊戲/動畫）即使沒人碰也會定時 on_render。
-         * 有觸控 → 立刻返回處理；逾時 → evt 沒填，只做 render。 */
+        /* Wake on a touch, or every UI_TICK_MS regardless, so screens that
+         * animate still get rendered when nobody is touching anything. */
         if (xQueueReceive(ui_event_queue, &evt, pdMS_TO_TICKS(UI_TICK_MS)) == pdTRUE) {
             Screen_OnTouch(evt.x, evt.y);
         }
-        Screen_OnRender();   /* 每輪都呼叫；靜態畫面的 on_render 留空即可 */
+        Screen_OnRender();   /* static screens simply leave on_render empty */
     }
 }
 
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * vInputTask — 一次按壓只送一個事件
+ * vInputTask — exactly one event per press.
  *
- * 為什麼需要「等放開 + 清通知」？
- *
- *   1. 手指按住不放期間，任何一個下降緣都會再送一次事件。
- *   2. 更麻煩的是 XPT2046 的 datasheet 行為：
- *      PENIRQ 在 ADC 轉換期間會被停用（拉高），轉換完才回到低電位
- *      → 我們「讀座標」這個動作本身就製造出一個新的下降緣
- *      → EXTI 是 FALLING 觸發 → 讀取自己觸發下一次讀取，自己餵自己。
- *
- * 所以處理完一次觸碰後，必須：等手指離開 → 等彈跳結束 →
- * 把期間累積的假通知清掉，才能回去等下一次真正的按下。
+ * The wait-for-release-then-drain dance is not just debouncing. Per the
+ * XPT2046 datasheet PENIRQ goes inactive during a conversion and returns low
+ * afterwards, so reading the coordinates manufactures a fresh falling edge on
+ * an EXTI configured for falling edges — the read retriggers itself and the
+ * task feeds itself forever. Draining the notifications is what breaks it.
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 void vInputTask(void *pvParameters)
 {
     for (;;) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);   /* 等按下 */
-        vTaskDelay(pdMS_TO_TICKS(10));             /* 按下的彈跳 */
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        vTaskDelay(pdMS_TO_TICKS(10));             /* press bounce */
 
         uint16_t x, y;
         if (XPT2046_ReadPixel(&x, &y)) {
@@ -428,37 +421,40 @@ void vInputTask(void *pvParameters)
             myprintf("touch: x=%3d y=%3d\r\n", x, y);
         }
 
-        /* ① 等手指真的放開（只讀 GPIO，不佔 SPI）*/
+        /* Wait for release — GPIO only, so it never takes the SPI bus. */
         while (XPT2046_IsTouched()) {
             vTaskDelay(pdMS_TO_TICKS(10));
         }
 
-        /* ② 離開瞬間的彈跳 */
+        /* release bounce */
         vTaskDelay(pdMS_TO_TICKS(50));
 
-        /* ③ 清掉這期間累積的假通知（PENIRQ 抖動造成的），
-         *    timeout = 0 → 不等待，純粹把計數歸零 */
+        /* Drop the spurious notifications PENIRQ generated meanwhile;
+         * timeout 0 just zeroes the count without waiting. */
         ulTaskNotifyTake(pdTRUE, 0);
     }
 }
 
 #if SD_STRESS_TEST
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * vSdStressTask — 暫時：SD 併發壓力測試（驗證 FatFs volume 鎖真的有效）
+ * vSdStressTask — proves the FatFs volume lock actually works.
  *
- * 兩個同優先級的 task 各自「寫一個可驗證 pattern → 讀回來 → 逐 byte 比對」。
- * 同優先級 + 時間片輪轉 → 會在 f_* 中途被切走 → 逼出真實的 FatFs 併發。
- * 沒有鎖的話：共用的 FATFS 視窗緩衝被踩爛 → 讀回內容錯 or FR_ 錯誤 → fail++
- * 有鎖的話  ：存取被序列化 → fail 永遠 0，而 ff_contend_n 會持續增加。
+ * Two equal-priority tasks each write a known pattern, read it back and
+ * byte-compare. Equal priority plus time slicing means they get preempted
+ * inside f_*, which is what produces genuine concurrent entry.
+ * Unlocked: the shared FATFS window gets clobbered and mismatches appear.
+ * Locked:  mismatches stay 0 while ff_contend_n keeps climbing — that rising
+ * counter is what distinguishes "the lock works" from "we never raced".
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 void vSdStressTask(void *pvParameters)
 {
-    int  id = *(const int *)pvParameters;        /* 0 或 1 */
+    int  id = *(const int *)pvParameters;        /* 0 or 1 */
     char path[16];
     snprintf(path, sizeof(path), "/STRESS%d.TXT", id + 1);
 
-    /* 暖身：f_mount 在 SD_SelfTest(vUITask) 才做，等掛載完成再開始計數，
-     * 否則開頭那幾十次「還沒掛載」的失敗會混進統計裡。 */
+    /* f_mount happens later, in SD_SelfTest on vUITask. Wait for it before
+     * counting, or the first few dozen not-yet-mounted failures pollute the
+     * statistics. */
     for (;;) {
         FRESULT fr = f_open(&sdst_fil[id], path, FA_CREATE_ALWAYS | FA_WRITE);
         if (fr == FR_OK) { f_close(&sdst_fil[id]); break; }
@@ -471,11 +467,11 @@ void vSdStressTask(void *pvParameters)
         FRESULT  fr  = FR_OK;
         UINT     bw = 0, br = 0;
 
-        /* 依 (id, 第幾輪) 產生可驗證的 pattern */
+        /* pattern derived from (id, iteration) so it is self-checking */
         for (int i = 0; i < SDST_BUF; i++)
             sdst_wbuf[id][i] = (uint8_t)(id * 71 + n * 13 + i);
 
-        /* 寫 */
+        /* write */
         fr = f_open(&sdst_fil[id], path, FA_CREATE_ALWAYS | FA_WRITE);
         if (fr != FR_OK) {
             bad = 1;
@@ -484,7 +480,7 @@ void vSdStressTask(void *pvParameters)
             if (fr != FR_OK || bw != SDST_BUF) bad = 2;
             f_close(&sdst_fil[id]);
         }
-        /* 讀回 */
+        /* read back */
         if (!bad) {
             memset(sdst_rbuf[id], 0, SDST_BUF);
             fr = f_open(&sdst_fil[id], path, FA_READ);
@@ -496,17 +492,17 @@ void vSdStressTask(void *pvParameters)
                 f_close(&sdst_fil[id]);
             }
         }
-        /* 驗證：寫進去的 == 讀出來的（這一項才是「資料損壞」）*/
+        /* the only check that means corruption */
         if (!bad && memcmp(sdst_wbuf[id], sdst_rbuf[id], SDST_BUF) != 0) {
             bad = 5;
-            sdst_mism[id]++;                    /* ← 損壞計數，必須永遠 0 */
+            sdst_mism[id]++;                    /* must stay 0 */
         }
 
         if (bad) {
             sdst_fail[id]++;
             sdst_lastbad[id] = bad;
             sdst_lastfr[id]  = (uint32_t)fr;
-            if (fr == FR_TIMEOUT) sdst_tmo[id]++;   /* 排隊等太久（非損壞）*/
+            if (fr == FR_TIMEOUT) sdst_tmo[id]++;   /* queued too long, not corruption */
         }
         sdst_iter[id]++;
         vTaskDelay(pdMS_TO_TICKS(2));
@@ -515,14 +511,12 @@ void vSdStressTask(void *pvParameters)
 #endif
 
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * vNetTask — 管 ESP32 UART：對時 + 收指令回話
+ * vNetTask — owns the ESP32 link.
  *
- * 為什麼獨立一個 task：網路操作可能傳很久（一次 HTTP 來回就好幾百 ms），
- * 放在 UI 迴圈會拖畫面。獨立 task + 低優先級，不跟渲染/觸控搶。
- *
- * 目前工作：TIME? 校準時鐘（對到前 3s 重試、對到後 60s 校準）、WX? 抓天氣、
- * MSG? 取 Discord 新訊息、有待送訊息就送 SEND；
- * 順便撈 ring buffer 把 ESP32 回話組成整行交給 esp_parse_line。
+ * Network round trips take hundreds of ms, so they get their own low-priority
+ * task rather than stalling rendering or touch. Polls TIME?, WX? and MSG?,
+ * sends queued messages, and reassembles replies from the ring buffer into
+ * lines for esp_parse_line.
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 void vNetTask(void *pvParameters)
 {
@@ -534,7 +528,7 @@ void vNetTask(void *pvParameters)
 
     for (;;) {
 
-        /* 定期送 TIME?：還沒對到時 3 秒重試，對到後 60 秒校準一次 */
+        /* retry every 3 s until synced, then re-sync every 60 s */
         uint32_t interval = g_time_valid ? 60000 : 3000;
         if (last_q == 0 || HAL_GetTick() - last_q >= interval) {
             last_q = HAL_GetTick();
@@ -542,14 +536,14 @@ void vNetTask(void *pvParameters)
             HAL_UART_Transmit(&huart3, (uint8_t *)msg, sizeof(msg) - 1, 100);
         }
 
-        /* 定期送 WX?：每 30 秒抓一次天氣（測試用，正式可放慢到數分鐘）*/
+        /* weather every 30 s */
         if (last_wx == 0 || HAL_GetTick() - last_wx >= 30000) {
             last_wx = HAL_GetTick();
             const char m2[] = "WX?\r\n";
             HAL_UART_Transmit(&huart3, (uint8_t *)m2, sizeof(m2) - 1, 100);
         }
 
-        /* 有待送訊息就先送（畫面按鈕觸發）*/
+        /* queued by Msg_Send() from the UI */
         if (g_send_req) {
             g_send_req = 0;
             char cmd[80];
@@ -557,14 +551,14 @@ void vNetTask(void *pvParameters)
             HAL_UART_Transmit(&huart3, (uint8_t *)cmd, n, 200);
         }
 
-        /* 每秒問一次有沒有新訊息（ESP32 自己輪詢 Discord，這裡只是便宜地取件）*/
+        /* The ESP32 polls Discord itself; this is just a cheap collection. */
         if (last_msg == 0 || HAL_GetTick() - last_msg >= 1000) {
             last_msg = HAL_GetTick();
             const char m3[] = "MSG?\r\n";
             HAL_UART_Transmit(&huart3, (uint8_t *)m3, sizeof(m3) - 1, 100);
         }
 
-        /* 撈 ring buffer，組行，遇換行就解析 */
+        /* drain the ring buffer, assemble lines, parse on newline */
         uint8_t rx;
         while (esp_rx_pop(&rx)) {
             if (rx == '\n' || rx == '\r') {
@@ -575,7 +569,7 @@ void vNetTask(void *pvParameters)
         }
 
 #if SD_STRESS_TEST
-        /* SD 併發壓力測試回報：fail 必須永遠 0，contend 必須 > 0（代表真的併發過）*/
+        /* fail must stay 0; contend must be > 0 or nothing actually raced */
         static uint32_t last_st = 0;
         if (HAL_GetTick() - last_st >= 2000) {
             last_st = HAL_GetTick();
@@ -590,7 +584,8 @@ void vNetTask(void *pvParameters)
         }
 #endif
 
-        /* 每 15 秒印一次各 task 的堆疊「歷來最少剩餘」（word 數），用來校準堆疊大小 */
+        /* Lowest free stack ever seen, in words. Only reflects code paths
+         * actually executed, so exercise GB/CHIP-8 before trusting it. */
         static uint32_t last_hw = 0;
         if (HAL_GetTick() - last_hw >= 15000) {
             last_hw = HAL_GetTick();
@@ -600,12 +595,12 @@ void vNetTask(void *pvParameters)
                      (unsigned long)uxTaskGetStackHighWaterMark(netTaskHandle));
         }
 
-        vTaskDelay(pdMS_TO_TICKS(20));   /* 20ms 輪詢一次，回話延遲可忽略 */
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
-/* GPIO EXTI callback — T_IRQ (PC5) 觸控中斷 → 通知 InputTask
- * 放在 main.c（USER CODE 保護區）而非 it.c，避免 CubeMX regen 弄丟 */
+/* T_IRQ (PC5) touch interrupt -> wake InputTask. Lives here rather than in
+ * stm32f4xx_it.c so a CubeMX regen cannot lose it. */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
     if (GPIO_Pin == GPIO_PIN_5) {
@@ -615,8 +610,8 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     }
 }
 
-/* FreeRTOS 堆疊溢位 hook — 任何 task 堆疊爆掉時被呼叫（configCHECK_FOR_STACK_OVERFLOW=2）
- * 立刻印出是哪個 task 並停住，接除錯器即可定位，不會再默默壞掉。 */
+/* Called by FreeRTOS when any task overflows its stack. Naming the task and
+ * halting beats the previous failure mode: silent memory corruption. */
 void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
 {
     (void)xTask;
@@ -625,53 +620,53 @@ void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
     for (;;) {}
 }
 
-/* UART 接收完成回呼 — HAL 每收到 1 byte 自動呼叫一次
- * 把 byte 塞進 ring buffer，然後重新武裝下一次接收 */
+/* HAL calls this per received byte. Push and re-arm — the receive is not
+ * automatically restarted. */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART3) {
         uint16_t next = (esp_rx_head + 1) % ESP_RX_SZ;
-        if (next != esp_rx_tail) {          /* buffer 沒滿才寫，滿了就丟掉這 byte */
+        if (next != esp_rx_tail) {          /* full: drop the byte */
             esp_rx_buf[esp_rx_head] = esp_rx_byte;
             esp_rx_head = next;
         }
-        HAL_UART_Receive_IT(&huart3, &esp_rx_byte, 1);   /* 重新武裝，繼續收下一個 */
+        HAL_UART_Receive_IT(&huart3, &esp_rx_byte, 1);
     }
 }
 
-/* 從 ring buffer 撈一個 byte；有資料回 1，空的回 0 */
+/* One byte out of the ring; 1 if there was data, 0 if empty. */
 static int esp_rx_pop(uint8_t *out)
 {
-    if (esp_rx_head == esp_rx_tail) return 0;   /* 空 */
+    if (esp_rx_head == esp_rx_tail) return 0;
     *out = esp_rx_buf[esp_rx_tail];
     esp_rx_tail = (esp_rx_tail + 1) % ESP_RX_SZ;
     return 1;
 }
 
-/* 解析一整行 ESP32 回話。目前認得 "TIME HH:MM:SS" → 更新時鐘 offset */
+/* Parse one complete reply line from the ESP32. */
 static void esp_parse_line(const char *s)
 {
-    if (strcmp(s, "MSGNONE") == 0) return;      /* 每秒都會有，不印免得洗版 */
-    myprintf("ESP: %s\r\n", s);                 /* debug：印出收到的整行 */
+    if (strcmp(s, "MSGNONE") == 0) return;      /* arrives every second; would flood the log */
+    myprintf("ESP: %s\r\n", s);
 
     unsigned h, m, sec;
     if (sscanf(s, "TIME %u:%u:%u", &h, &m, &sec) == 3) {
-        uint32_t uptime = xTaskGetTickCount() / configTICK_RATE_HZ;   /* 開機至今秒數 */
-        uint32_t target = h * 3600 + m * 60 + sec;                    /* 真實的一天秒數 */
-        /* offset：讓 (uptime + offset) 的一天秒數 == target */
+        uint32_t uptime = xTaskGetTickCount() / configTICK_RATE_HZ;
+        uint32_t target = h * 3600 + m * 60 + sec;                    /* wall-clock seconds of day */
+        /* pick offset so (uptime + offset) mod 86400 == target */
         g_clock_offset = (target + 86400u - (uptime % 86400u)) % 86400u;
         g_time_valid = 1;
         return;
     }
 
-    /* "WX <內容>" → 存起來（之後放上畫面）*/
+    /* "WX <text>" */
     if (strncmp(s, "WX ", 3) == 0) {
         strncpy(g_weather, s + 3, sizeof(g_weather) - 1);
         g_weather[sizeof(g_weather) - 1] = '\0';
         return;
     }
 
-    /* "MSG <user>: <text>" → 收到一則 Discord 訊息，存進 ring */
+    /* "MSG <user>: <text>" */
     if (strncmp(s, "MSG ", 4) == 0) {
         char *slot = g_msgs[g_msg_n % MSG_MAX];
         strncpy(slot, s + 4, MSG_LEN - 1);
@@ -681,27 +676,26 @@ static void esp_parse_line(const char *s)
         return;
     }
 
-    /* 送出結果 */
+    /* send result */
     if (strcmp(s, "SENDOK")  == 0) { g_send_result = 2; return; }
     if (strcmp(s, "SENDERR") == 0) { g_send_result = 3; return; }
 }
 
-/* 給畫面用：請求送一則訊息到 Discord（非阻塞，NetTask 會取走送出）*/
+/* Non-blocking: queues the text for NetTask so the UI never touches UART. */
 void Msg_Send(const char *text)
 {
-    if (g_send_req) return;                  /* 上一則還沒送完 */
+    if (g_send_req) return;                  /* previous send still pending */
     strncpy(g_send_text, text, sizeof(g_send_text) - 1);
     g_send_text[sizeof(g_send_text) - 1] = '\0';
-    g_send_result = 1;                       /* 送出中 */
+    g_send_result = 1;
     g_send_req    = 1;
 }
 
 /* USER CODE END 4 */
 
 /**
-  * @brief DMA2 初始化 — 只開時脈 + NVIC，實際 stream 設定在 HAL_SPI_MspInit 裡
-  *
-  * DMA 必須在使用它的周邊（SPI1）之前初始化，否則 HAL_DMA_Init 會失敗。
+  * @brief DMA2 — clock and NVIC only; the stream itself is set up in
+  *        HAL_SPI_MspInit. Must run before SPI1 init or HAL_DMA_Init fails.
   */
 static void MX_DMA_Init(void)
 {

@@ -9,30 +9,26 @@
 #include <string.h>
 #include <stdio.h>
 
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * Messages — Discord 訊息收發
+/* Messages — Discord chat.
  *
- * 收：ESP32 每 3 秒輪詢 Discord，把新訊息放進它的佇列；vNetTask 每秒用
- *     "MSG?" 取件，存進 g_msgs[] ring buffer。這裡只負責顯示。
- * 發：按預設按鈕 → Msg_Send() 排入待送 → vNetTask 送 "SEND <text>"。
- *     按 Type → 打開螢幕鍵盤（screen_kb），打完 Send 才回呼到這裡送出。
+ * Receiving and sending both happen in vNetTask; this file only draws. New
+ * messages arrive in the g_msgs ring, sends are queued with Msg_Send().
  *
- * 重畫策略跟時鐘/天氣一樣：只有「總則數」或「送出狀態」變了才重畫，
- * 否則每個 UI tick 都畫會閃。
- * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+ * Redraw only when the message count or send state changes — redrawing every
+ * UI tick flickers. */
 
-/* 這幾個定義必須跟 main.c 一致 */
+/* Must match main.c. */
 #define MSG_MAX 8
 #define MSG_LEN 40
 extern char              g_msgs[MSG_MAX][MSG_LEN];
 extern volatile uint32_t g_msg_n;
 extern volatile uint8_t  g_msg_unread;
-extern volatile uint8_t  g_send_result;   /* 0=閒置 1=送出中 2=成功 3=失敗 */
+extern volatile uint8_t  g_send_result;   /* 0 idle, 1 sending, 2 sent, 3 failed */
 extern char              g_weather[];
 void Msg_Send(const char *text);
 
-#define MSG_Y   36                        /* 訊息列表起始 y */
-#define BTN_Y   170                       /* 預設按鈕列 y */
+#define MSG_Y   36
+#define BTN_Y   170
 #define BTN_H   34
 #define BTN_N   4
 
@@ -49,10 +45,10 @@ static const msgbtn_t BTNS[BTN_N] = {
     { 244, 72, ILI9341_MAGENTA, "Type" },
 };
 
-static uint32_t shown_n;        /* 上次畫出時的總則數 */
-static uint8_t  shown_send;     /* 上次畫出的送出狀態 */
+static uint32_t shown_n;
+static uint8_t  shown_send;
 
-/* 畫一行訊息："user: text" —— 使用者名稱用青色，內容白色 */
+/* "user: text" with the name in cyan. */
 static void draw_row(int row, const char *s)
 {
     uint16_t y = MSG_Y + row * FONT_HEIGHT;
@@ -61,7 +57,7 @@ static void draw_row(int row, const char *s)
 
     const char *colon = strchr(s, ':');
     if (colon != NULL && (colon - s) < 20) {
-        int nlen = (int)(colon - s) + 1;          /* 含冒號 */
+        int nlen = (int)(colon - s) + 1;          /* including the colon */
         char name[24];
         if (nlen > (int)sizeof(name) - 1) nlen = (int)sizeof(name) - 1;
         memcpy(name, s, nlen);
@@ -74,11 +70,11 @@ static void draw_row(int row, const char *s)
     }
 }
 
-/* 把最近 MSG_MAX 則畫出來，舊的在上、新的在下 */
+/* Last MSG_MAX messages, oldest at the top. */
 static void draw_list(void)
 {
     uint32_t n     = g_msg_n;
-    uint32_t start = (n > MSG_MAX) ? (n - MSG_MAX) : 0;   /* 從第幾則開始顯示 */
+    uint32_t start = (n > MSG_MAX) ? (n - MSG_MAX) : 0;
 
     for (int row = 0; row < MSG_MAX; row++) {
         uint32_t k = start + row;
@@ -100,7 +96,7 @@ static void draw_buttons(void)
     }
 }
 
-/* 送出狀態顯示在軟鍵列左側 */
+/* Send status, drawn in the left half of the softkey bar. */
 static void draw_status(void)
 {
     const char *txt;
@@ -122,12 +118,12 @@ static void msg_enter(void)
     UI_DrawFrame("Messages", NULL, "Back");
     draw_buttons();
 
-    g_msg_unread = 0;              /* 進來就算已讀 */
-    shown_n      = 0xFFFFFFFFu;    /* 強制重畫列表 */
+    g_msg_unread = 0;              /* opening the screen marks them read */
+    shown_n      = 0xFFFFFFFFu;    /* force a redraw */
     shown_send   = 0xFF;
 }
 
-/* 鍵盤按下 Send 後的回呼（此時鍵盤已經 pop 掉，我們又是最上層畫面）*/
+/* Called after the keyboard has already popped, so this screen is on top. */
 static void kb_done(const char *text)
 {
     if (text != NULL && text[0] != '\0')
@@ -148,14 +144,14 @@ static void msg_touch(uint16_t x, uint16_t y)
         } else if (i == 1) {
             Msg_Send("OK");
         } else if (i == 2) {
-            /* 帶上裝置實際狀態，證明訊息真的來自這台機器 */
+            /* real device state, so the message is visibly from the handheld */
             uint32_t up = xTaskGetTickCount() / configTICK_RATE_HZ;
             char info[64];
             snprintf(info, sizeof(info), "up %lus | %s",
                      (unsigned long)up, g_weather[0] ? g_weather : "no weather");
             Msg_Send(info);
         } else {
-            /* 鍵盤按 Send 才會回呼 kb_done；按 Back 就什麼都不做 */
+            /* kb_done only runs on Send; Back does nothing */
             Keyboard_Open("Message", "", kb_done);
         }
         return;
@@ -166,7 +162,7 @@ static void msg_render(void)
 {
     if (g_msg_n != shown_n) {
         shown_n      = g_msg_n;
-        g_msg_unread = 0;          /* 停留在這個畫面時，收到即已讀 */
+        g_msg_unread = 0;          /* already looking at them */
         draw_list();
     }
     if (g_send_result != shown_send) {
