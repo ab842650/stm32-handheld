@@ -164,7 +164,12 @@ Drivers/BSP
 
 ⚠️ 從現在起 Arduino IDE 要開 **repo 裡的** `esp32/wifi_bridge/`，不是 `Documents\Arduino\sketch_jul30a`。
 
-**下一步**：README 補上整條 WiFi/Discord/併發線（目前 README 還停在 Game Boy 階段），然後錄 demo 影片。
+**收尾（同日）**：
+- **註解全面英文化 + 精簡**（32 個檔，-1030/+727 行）。判準：留下「不知道就會以為是 bug」的東西（MADCTL 各 bit 與觸控映射的耦合、觸控讀取要降頻、DMA 碰不到 CCM、PENIRQ 自我觸發、壓力測試 contention counter 的用途），砍掉重述 code、除錯故事、教學式說明 —— 那些 DEV_LOG 都有。
+  - 驗證方式：`arm-none-eabi-gcc -fpreprocessed -dD -E` 把新舊版本的註解剝掉再 diff，32 個檔全部 `code identical`。比「編得過」強，編得過只證明語法對。
+- **README 重寫**：改成以「功能 + 使用技術」為主軸，補上整條 WiFi/Discord 線、螢幕鍵盤、以及三個工程重點（ROM 軟體快取、FatFs 併發除錯與證明、runtime 記憶體量測）。
+
+**下一步**：錄 demo 影片。
 
 ### 2026-08-03(續二）｜ Discord 訊息 App —— 這台機器會傳訊息了
 
