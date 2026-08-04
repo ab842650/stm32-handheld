@@ -20,6 +20,14 @@ Every driver and every peripheral init is hand-written. The engineering log,
 including the bugs and the reasoning behind each decision, is in
 **[DEV_LOG.md](DEV_LOG.md)**.
 
+## Demo
+
+**▶ [Watch the demo video](https://drive.google.com/file/d/1G74l75u3DNy1aKpoiGos22fDyOqNpNuh/view?usp=drive_link)**
+
+Running on real hardware: the home menu and apps, sending a typed message to
+Discord over WiFi, Pokémon Red on the Game Boy emulator, and loading a native
+game module from the SD card.
+
 ---
 
 ## Contents
