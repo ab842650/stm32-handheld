@@ -13,12 +13,12 @@ void UI_DrawFrame(const char *title, const char *left, const char *right)
 {
     ILI9341_FillScreen(ILI9341_BLACK);
 
-    /* 標題列 */
+    /* title bar */
     ILI9341_FillRect(0, 0, ILI9341_WIDTH, UI_TITLE_H, ILI9341_NAVY);
     UI_DrawCentered((UI_TITLE_H - FONT_HEIGHT) / 2, title,
                     ILI9341_WHITE, ILI9341_NAVY);
 
-    /* 軟鍵列 */
+    /* softkey bar */
     ILI9341_FillRect(0, UI_SOFT_Y, ILI9341_WIDTH, UI_SOFT_H, ILI9341_NAVY);
     uint16_t sy = UI_SOFT_Y + (UI_SOFT_H - FONT_HEIGHT) / 2;
 
@@ -34,6 +34,6 @@ void UI_DrawFrame(const char *title, const char *left, const char *right)
 
 bool UI_BackTouched(uint16_t x, uint16_t y)
 {
-    /* 軟鍵列的右半邊都算 Back（觸控目標放大，好按）*/
+    /* The whole right half of the bar counts, for a bigger touch target. */
     return (y >= UI_SOFT_Y) && (x >= ILI9341_WIDTH / 2);
 }

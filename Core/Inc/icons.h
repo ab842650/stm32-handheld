@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-/* 16x16 單色圖示，每列 2 bytes（MSB 在左），共 16 列 = 32 bytes */
+/* 16x16 1-bpp icons: 2 bytes per row (MSB leftmost), 16 rows = 32 bytes. */
 #define ICON_SIZE  16
 
 extern const uint8_t icon_calc[32];

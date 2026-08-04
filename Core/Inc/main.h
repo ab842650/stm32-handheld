@@ -26,16 +26,16 @@ void Error_Handler(void);
 /* Private defines -----------------------------------------------------------*/
 /* USER CODE BEGIN Private defines */
 
-/* SD 卡 SPI 介面（user_diskio_spi.c 依賴這幾個 define）
- * 獨立 SPI2（PB13/14/15），與 ILI9341/XPT2046 的 SPI1 分開；SD_CS 接 PC7 */
+/* SD card SPI, required by user_diskio_spi.c. On its own bus (SPI2,
+ * PB13/14/15) so it never contends with the display and touch on SPI1. */
 #define SD_SPI_HANDLE       hspi2
 #define SD_CS_Pin           GPIO_PIN_7
 #define SD_CS_GPIO_Port     GPIOC
 
 /* USER CODE END Private defines */
 
-/* BSP include path: Drivers/BSP/ 需加入 STM32CubeIDE Project → Properties
- * → C/C++ Build → Settings → Include Paths：../Drivers/BSP             */
+/* ../Drivers/BSP must be on the include path: STM32CubeIDE Project ->
+ * Properties -> C/C++ Build -> Settings -> Include Paths */
 
 #ifdef __cplusplus
 }

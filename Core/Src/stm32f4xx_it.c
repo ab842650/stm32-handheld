@@ -37,7 +37,7 @@ void EXTI0_IRQHandler(void)
 }
 
 /**
-  * @brief DMA2 Stream3 — SPI1_TX 完成中斷
+  * @brief DMA2 Stream3 — SPI1_TX transfer complete
   */
 void DMA2_Stream3_IRQHandler(void)
 {
@@ -55,8 +55,9 @@ void TIM2_IRQHandler(void)
 /* USER CODE BEGIN 1 */
 
 /**
-  * @brief EXTI9_5 — T_IRQ (PC5) 觸控中斷，falling edge
-  * @note  對應的 HAL_GPIO_EXTI_Callback 放在 main.c（USER CODE 區）以防 regen
+  * @brief EXTI9_5 — T_IRQ (PC5) touch interrupt, falling edge
+  * @note  HAL_GPIO_EXTI_Callback lives in main.c inside a USER CODE block so a
+  *        CubeMX regen would not wipe it.
   */
 void EXTI9_5_IRQHandler(void)
 {
@@ -64,7 +65,7 @@ void EXTI9_5_IRQHandler(void)
 }
 
 /**
-  * @brief USART3 — ESP32 UART。HAL 處理旗標並在收滿時呼叫 RxCpltCallback
+  * @brief USART3 — ESP32 link. HAL clears the flags and calls RxCpltCallback.
   */
 void USART3_IRQHandler(void)
 {

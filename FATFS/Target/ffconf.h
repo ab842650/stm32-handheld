@@ -226,9 +226,9 @@
 /  _NORTC_MDAY and _NORTC_YEAR have no effect.
 /  These options have no effect at read-only configuration (_FS_READONLY = 1). */
 
-#define _FS_LOCK    6     /* 0:Disable or >=1:Enable —— 同時可開檔數。2 太少：
-                             GB 遊玩時 gb_fil 常駐佔 1，再加下載/Photo/Notes 就爆
-                             （FR_TOO_MANY_OPEN_FILES=18）。每個名額僅 8 bytes。 */
+#define _FS_LOCK    6     /* Max files open at once. 2 was too few: a GB session
+                             pins gb_fil for its whole run, so Photo/Notes on top
+                             hit FR_TOO_MANY_OPEN_FILES (18). 8 bytes per slot. */
 /* The option _FS_LOCK switches file lock function to control duplicated file open
 /  and illegal operation to open objects. This option must be 0 when _FS_READONLY
 /  is 1.
@@ -239,11 +239,14 @@
 /      can be opened simultaneously under file lock control. Note that the file
 /      lock control is independent of re-entrancy. */
 
-#define _FS_REENTRANT    1  /* 0:Disable or 1:Enable —— 開啟：FatFs 自動在每個 f_* 上鎖 */
+/* ON: FatFs takes the volume lock inside every f_* call. Required here —
+ * UITask and NetTask both touch the card, and without this they corrupted the
+ * shared window buffer and the on-disk FAT. Separate from _FS_LOCK above. */
+#define _FS_REENTRANT    1
 #define _FS_TIMEOUT      1000 /* Timeout period in unit of time ticks */
 #include "FreeRTOS.h"
 #include "semphr.h"
-#define _SYNC_t          SemaphoreHandle_t   /* 用 FreeRTOS mutex 當 volume 鎖 */
+#define _SYNC_t          SemaphoreHandle_t   /* volume lock = FreeRTOS mutex */
 /* The option _FS_REENTRANT switches the re-entrancy (thread safe) of the FatFs
 /  module itself. Note that regardless of this option, file access to different
 /  volume is always re-entrant and volume control functions, f_mount(), f_mkfs()

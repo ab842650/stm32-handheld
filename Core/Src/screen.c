@@ -6,7 +6,7 @@
 static screen_t screens[SCREEN_COUNT];
 
 static screen_id_t stack[SCREEN_STACK_MAX];
-static int stack_top = -1;   /* -1 = 空 */
+static int stack_top = -1;   /* -1 = empty */
 
 screen_id_t Screen_Current(void){
 	return stack[stack_top];
@@ -31,7 +31,7 @@ void Screen_Push(screen_id_t id){
 }
 
 void Screen_Pop(void){
-	if (stack_top <= 0) return;   /* 最底層不能再彈出 */
+	if (stack_top <= 0) return;   /* never pop the root screen */
 
 	if (screens[stack[stack_top]].on_exit != NULL)
 		screens[stack[stack_top]].on_exit();
