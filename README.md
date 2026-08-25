@@ -286,11 +286,3 @@ module to `<NAME>.BIN`; copy it to `/GAMES` on the card.
 /PHOTOS/*.jpg    images for the photo viewer
 /NOTES/*.txt     text files for Notes
 ```
-
-## Known limitations
-
-- **ASCII only.** The bitmap font covers `0x20`–`0x7E`, so non-ASCII in Discord
-  messages and weather strings is stripped at the co-processor. CJK would need
-  an SD-resident glyph file and UTF-8 decoding — evaluated, deferred.
-- Menus do not scroll, so the launcher shows the first few entries only.
-- WiFi credentials and the bot token are plaintext in `secrets.h` on the ESP32.
