@@ -77,56 +77,13 @@ redraws: the clock repaints only when the second changes.
 | SRAM (128 KB) | RTOS heap, DMA buffers, cart RAM | **DMA cannot reach CCM** |
 | CCM (64 KB) | Emulator working RAM, ROM cache | Fast, and otherwise unused |
 
-CCM being neither DMA-capable nor a good fit for everything is exactly why the
-loader and the ROM cache are shaped the way they are.
+CCM is fast but unreachable by DMA, which is the constraint that shapes both the
+loader and the Game Boy ROM cache: the cache lives in CCM, while every buffer a
+peripheral touches has to stay in SRAM.
 
 The project also deliberately **does not regenerate with CubeMX**: peripherals
 added by hand (SPI2 for the card, USART3 for WiFi) live outside the `USER CODE`
 markers, and a regen would wipe the display and touch pin setup.
-
-## Engineering highlights
-
-### A software CPU cache made Pokémon playable
-
-Pokémon Red is 1 MB — it cannot live in RAM, so ROM reads are served from the SD
-card. The obvious design, one 16 KB bank slot, thrashed: the game's working set
-is scattered, so nearly every access missed and cost a ~12 ms bank load.
-
-Replacing it with a **32-line × 512 B direct-mapped cache** in CCM changed the
-granularity — a miss now costs one ~1 ms read, and 32 lines hold the scattered
-hot spots simultaneously. **Single-digit fps → ~60 fps.** A hands-on lesson in
-line size, working set and locality, on a chip with no cache of its own.
-
-### Diagnosing real filesystem corruption
-
-Symptom: Pokémon froze at the intro and the FPS counter read in the tens of
-thousands. The chain: instrument the ROM reader → SD reads were returning
-`FR_INT_ERR` → the cache was tagging lines valid even when the read failed, so
-it served garbage forever → `chkdsk` on a PC named the exact files as corrupt,
-confirming the damage was on the card, not in RAM. Root cause: `_FS_REENTRANT`
-was `0`, and a download in `NetTask` had been racing `UITask`'s reads, clobbering
-the shared FatFs window buffer and writing garbage into the on-disk FAT.
-
-The fix enables FatFs's own volume lock rather than hand-wrapping eleven call
-sites, because a hand-rolled mutex can be forgotten at one site — and this one
-had already proven it would corrupt the card silently.
-
-**Then it was proven.** A stress test runs two equal-priority tasks that write a
-pattern, read it back and byte-compare; equal priority plus time slicing gets
-them preempted *inside* `f_*` calls. The key detail is the instrumentation: the
-lock's acquire path first tries a zero-timeout take, so a failure counts as
-*genuine contention* — distinguishing "the lock works" from "nothing ever
-actually raced". Result over ~10,100 iterations: **10,206 real contentions, 0
-mismatches, 0 failures**, and a clean `chkdsk` afterwards. Still in the tree
-behind `#define SD_STRESS_TEST`.
-
-### Runtime memory instrumentation
-
-Repeated stack overflows — one of which killed touch permanently after every
-download — prompted proper tooling rather than guesswork:
-`configCHECK_FOR_STACK_OVERFLOW=2` with a hook that names the offending task and
-halts, periodic per-task high-water marks, and `-fstack-usage` at build time.
-That case was a `FIL` (~560 B) plus a 512 B buffer on a 2 KB task stack.
 
 ## Repository layout
 
