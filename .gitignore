@@ -25,6 +25,12 @@ tools/*.bmp
 # （範本是 esp32/wifi_bridge/secrets.h.example，那個要進版控）
 esp32/*/secrets.h
 
+# 個人筆記：只留在本機，不推上 GitHub
+DEV_LOG.md
+DEBUG_LOG.md
+project_spec.md
+QA.md
+
 # IDE / 本機
 .claude/
 .settings/language.settings.xml
